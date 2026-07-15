@@ -304,6 +304,10 @@ public class GapicSpannerRpc implements SpannerRpc {
 
   private final GrpcCallContext baseGrpcCallContext;
 
+  // Inside GapicSpannerRpc class fields
+  private final GetSessionProbe getSessionProbe = new GetSessionProbe();
+
+
   public static GapicSpannerRpc create(SpannerOptions options) {
     return new GapicSpannerRpc(options);
   }
@@ -313,6 +317,7 @@ public class GapicSpannerRpc implements SpannerRpc {
   }
 
   GapicSpannerRpc(final SpannerOptions options, boolean initializeStubs) {
+    System.out.println("################# Using Local Cloud Spanner Client #################^");
     this.projectId = options.getProjectId();
     String projectNameStr = PROJECT_NAME_TEMPLATE.instantiate("project", this.projectId);
     try {
@@ -580,6 +585,7 @@ public class GapicSpannerRpc implements SpannerRpc {
     }
   }
 
+
   @VisibleForTesting
   GcpFallbackChannelOptions createFallbackChannelOptions(
       GcpFallbackOpenTelemetry fallbackTelemetry, int minFailedCalls) {
@@ -589,6 +595,8 @@ public class GapicSpannerRpc implements SpannerRpc {
         .setMinFailedCalls(minFailedCalls)
         .setPeriod(Duration.ofMinutes(3))
         .setGcpFallbackOpenTelemetry(fallbackTelemetry)
+        .setPrimaryProbingFunction(getSessionProbe)
+        .setPrimaryProbingInterval(Duration.ofSeconds(30))
         .build();
   }
 
@@ -1959,7 +1967,15 @@ public class GapicSpannerRpc implements SpannerRpc {
     CreateSessionRequest request = requestBuilder.build();
     GrpcCallContext context =
         newCallContext(options, databaseName, request, SpannerGrpc.getCreateSessionMethod(), true);
-    return get(spannerStub.createSessionCallable().futureCall(request, context));
+    // Execute the call
+    Session session = get(spannerStub.createSessionCallable().futureCall(request, context));
+    
+    // Capture the multiplexed session name for the prober
+    if (isMultiplexed && session != null) {
+      getSessionProbe.setSessionName(session.getName());
+    }
+    
+    return session;
   }
 
   @Override
@@ -2567,6 +2583,108 @@ public class GapicSpannerRpc implements SpannerRpc {
     String stringValue = System.getProperty(name, "");
     return Duration.ofSeconds(stringValue.isEmpty() ? defaultValue : Integer.parseInt(stringValue));
   }
+
+  private class GetSessionProbe implements com.google.common.base.Function<io.grpc.Channel, String> {
+    private final java.util.concurrent.atomic.AtomicReference<String> sessionName =
+        new java.util.concurrent.atomic.AtomicReference<>(null);
+
+    // Counter to rotate the keys across cycles
+    private final java.util.concurrent.atomic.AtomicInteger affinityCounter = 
+        new java.util.concurrent.atomic.AtomicInteger(0);
+
+    public void setSessionName(String name) {
+      System.out.println("@@@@@@@@@@@@@@ Setting session name for GetSession Probe @@@@@@@@@@@@@@");
+      this.sessionName.set(name);
+    }
+
+    @Override
+    public String apply(io.grpc.Channel channel) {
+      String name = sessionName.get();
+      if (name == null) {
+        return "WAITING_FOR_REAL_SESSION";
+      }
+
+      try {
+        System.out.println("@@@@@@@@@@@@@@ Sending GetSession Probes @@@@@@@@@@@@@@");
+        com.google.spanner.v1.GetSessionRequest request =
+            com.google.spanner.v1.GetSessionRequest.newBuilder().setName(name).build();
+
+        java.util.Map<String, java.util.List<String>> extraHeaders = 
+            metadataProvider.newExtraHeaders(name, projectName);
+        
+        io.grpc.Metadata metadata = new io.grpc.Metadata();
+        for (java.util.Map.Entry<String, java.util.List<String>> entry : extraHeaders.entrySet()) {
+          io.grpc.Metadata.Key<String> key = 
+              io.grpc.Metadata.Key.of(entry.getKey(), io.grpc.Metadata.ASCII_STRING_MARSHALLER);
+          if (entry.getValue() != null) {
+            for (String value : entry.getValue()) {
+              metadata.put(key, value);
+            }
+          }
+        }
+
+        java.util.List<com.google.common.util.concurrent.ListenableFuture<com.google.spanner.v1.Session>> futures = 
+            new java.util.ArrayList<>();
+
+        // Grab the starting key for this 30-second cycle
+        int startKey = Math.abs(affinityCounter.getAndAdd(8));
+
+        // Launch exactly 8 concurrent probes, but use the rotating keys!
+        for (int i = 0; i < 8; i++) {
+          // Cycle safely between 0 and 39
+          int currentAffinity = (startKey + i) % 40;
+
+          com.google.spanner.v1.SpannerGrpc.SpannerFutureStub stub =
+              com.google.spanner.v1.SpannerGrpc.newFutureStub(channel)
+                  .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(metadata))
+                  .withOption(GcpManagedChannel.AFFINITY_KEY, String.valueOf(currentAffinity))
+                  .withDeadlineAfter(10, java.util.concurrent.TimeUnit.SECONDS);
+
+          if (callCredentialsProvider != null) {
+            io.grpc.CallCredentials creds = callCredentialsProvider.getCallCredentials();
+            if (creds != null) {
+              stub = stub.withCallCredentials(creds);
+            }
+          }
+          futures.add(stub.getSession(request));
+        }
+
+        boolean allSucceeded = true;
+        String lastError = "ERROR";
+
+        // Wait for all concurrent probes to finish and log their specific affinity keys
+        for (int i = 0; i < futures.size(); i++) {
+          int currentAffinity = (startKey + i) % 40;
+          try {
+            futures.get(i).get(); 
+            System.out.println("GetSession Probe OK for AFFINITY_KEY: " + currentAffinity);
+          } catch (java.util.concurrent.ExecutionException e) {
+            allSucceeded = false;
+            Throwable cause = e.getCause();
+            if (cause instanceof io.grpc.StatusRuntimeException) {
+               lastError = ((io.grpc.StatusRuntimeException) cause).getStatus().getCode().name();
+               System.out.println("Probe FAILED with " + lastError + " for AFFINITY_KEY " + currentAffinity);
+            } else {
+               System.out.println("Probe FAILED with ERROR for AFFINITY_KEY " + currentAffinity);
+            }
+          }
+        }
+
+        if (allSucceeded) {
+          return "OK";
+        } else {
+          return lastError;
+        }
+
+      } catch (Exception e) {
+        return "ERROR";
+      }
+    }
+  }
+
+
+
+
 
   // Wrapper class to build the GcpFallbackChannel using GAX's configuration
   private static class FallbackChannelBuilder

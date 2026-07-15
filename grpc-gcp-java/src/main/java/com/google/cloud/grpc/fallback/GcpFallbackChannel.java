@@ -52,6 +52,10 @@ public class GcpFallbackChannel extends ManagedChannel {
   private final Channel fallbackChannel;
   private final AtomicLong primarySuccesses = new AtomicLong(0);
   private final AtomicLong primaryFailures = new AtomicLong(0);
+  private final AtomicLong primaryProbeSuccesses = new AtomicLong(0);
+  private final AtomicLong primaryProbeErrors = new AtomicLong(0);
+  private final AtomicLong primaryProbeTotal = new AtomicLong(0);
+  private final AtomicLong primaryProbeConsecutive = new AtomicLong(0);
   private final AtomicLong fallbackSuccesses = new AtomicLong(0);
   private final AtomicLong fallbackFailures = new AtomicLong(0);
   private boolean inFallbackMode = false;
@@ -79,6 +83,7 @@ public class GcpFallbackChannel extends ManagedChannel {
       ManagedChannelBuilder<?> primaryChannelBuilder,
       ManagedChannelBuilder<?> fallbackChannelBuilder,
       ScheduledExecutorService execService) {
+    System.out.println("************* Using Local GcpFallbackChannel *************^");
     checkNotNull(options);
     checkNotNull(primaryChannelBuilder);
     checkNotNull(fallbackChannelBuilder);
@@ -210,6 +215,7 @@ public class GcpFallbackChannel extends ManagedChannel {
     long successes = primarySuccesses.getAndSet(0);
     long failures = primaryFailures.getAndSet(0);
     float errRate = 0f;
+    System.out.println("isInFallbackMode: " + isInFallbackMode());
     if (failures + successes > 0) {
       errRate = (float) failures / (failures + successes);
     }
@@ -223,6 +229,7 @@ public class GcpFallbackChannel extends ManagedChannel {
               .getModule()
               .reportFallback(options.getPrimaryChannelName(), options.getFallbackChannelName());
         }
+        System.out.println("&&&&&&&&& Switching to fallback &&&&&&&&&&");
         inFallbackMode = true;
       }
     }
@@ -244,6 +251,7 @@ public class GcpFallbackChannel extends ManagedChannel {
   }
 
   private void processPrimaryStatusCode(Status.Code statusCode) {
+    // System.out.println("DEBUG: [PRIMARY CHANNEL] Status Code: " + statusCode);
     if (options.getErroneousStates().contains(statusCode)) {
       // Count error.
       primaryFailures.incrementAndGet();
@@ -256,6 +264,7 @@ public class GcpFallbackChannel extends ManagedChannel {
   }
 
   private void processFallbackStatusCode(Status.Code statusCode) {
+    // System.out.println("DEBUG: [FALLBACK CHANNEL] Status Code: " + statusCode);
     if (options.getErroneousStates().contains(statusCode)) {
       // Count error.
       fallbackFailures.incrementAndGet();
@@ -268,11 +277,30 @@ public class GcpFallbackChannel extends ManagedChannel {
   }
 
   private void probePrimary() {
+    if (!isInFallbackMode()) {
+      return;
+    }
     String result = "";
     if (primaryDelegateChannel == null) {
       result = INIT_FAILURE_REASON;
     } else {
       result = options.getPrimaryProbingFunction().apply(primaryDelegateChannel);
+    }
+    long primaryProbeTotalCount = primaryProbeTotal.incrementAndGet();
+    System.out.println("DEBUG: [PRIMARY PROBE] Result " + result);
+    if (result == "OK") {
+      long primaryProbeSuccesCount = primaryProbeSuccesses.incrementAndGet();
+      long primaryProbeConsecutiveCount = primaryProbeConsecutive.incrementAndGet(); 
+      System.out.println("+++++++++ Probe success count: " + primaryProbeSuccesCount + " Probe consecutive success count: " + primaryProbeConsecutiveCount + " Probe Total count: " + primaryProbeTotalCount);
+      if (primaryProbeConsecutiveCount > 40) {
+        inFallbackMode = false;
+        System.out.println("$$$$$$$$$$ Recovering to directpath $$$$$$$$$$$$$");
+        primaryProbeConsecutive.getAndSet(0);
+      }
+    } else {
+      long primaryProbeErrorCount = primaryProbeErrors.incrementAndGet();
+      System.out.println("------- Reseting probe success count ---------");
+      primaryProbeConsecutive.getAndSet(0);
     }
     // Report metric based on result.
     openTelemetry.getModule().reportProbeResult(options.getPrimaryChannelName(), result);
