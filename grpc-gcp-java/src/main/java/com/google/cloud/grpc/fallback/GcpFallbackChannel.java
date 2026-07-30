@@ -53,9 +53,6 @@ public class GcpFallbackChannel extends ManagedChannel {
   private final AtomicLong primarySuccesses = new AtomicLong(0);
   private final AtomicLong primaryFailures = new AtomicLong(0);
   private final AtomicLong primaryProbeSuccesses = new AtomicLong(0);
-  private final AtomicLong primaryProbeErrors = new AtomicLong(0);
-  private final AtomicLong primaryProbeTotal = new AtomicLong(0);
-  private final AtomicLong primaryProbeConsecutive = new AtomicLong(0);
   private final AtomicLong fallbackSuccesses = new AtomicLong(0);
   private final AtomicLong fallbackFailures = new AtomicLong(0);
   private boolean inFallbackMode = false;
@@ -185,7 +182,7 @@ public class GcpFallbackChannel extends ManagedChannel {
 
   private void init() {
     if (options.getPrimaryProbingFunction() != null) {
-      execService.scheduleAtFixedRate(
+      execService.scheduleWithFixedDelay(
           this::probePrimary,
           options.getPrimaryProbingInterval().toMillis(),
           options.getPrimaryProbingInterval().toMillis(),
@@ -251,7 +248,6 @@ public class GcpFallbackChannel extends ManagedChannel {
   }
 
   private void processPrimaryStatusCode(Status.Code statusCode) {
-    // System.out.println("DEBUG: [PRIMARY CHANNEL] Status Code: " + statusCode);
     if (options.getErroneousStates().contains(statusCode)) {
       // Count error.
       primaryFailures.incrementAndGet();
@@ -264,7 +260,6 @@ public class GcpFallbackChannel extends ManagedChannel {
   }
 
   private void processFallbackStatusCode(Status.Code statusCode) {
-    // System.out.println("DEBUG: [FALLBACK CHANNEL] Status Code: " + statusCode);
     if (options.getErroneousStates().contains(statusCode)) {
       // Count error.
       fallbackFailures.incrementAndGet();
@@ -286,21 +281,18 @@ public class GcpFallbackChannel extends ManagedChannel {
     } else {
       result = options.getPrimaryProbingFunction().apply(primaryDelegateChannel);
     }
-    long primaryProbeTotalCount = primaryProbeTotal.incrementAndGet();
     System.out.println("DEBUG: [PRIMARY PROBE] Result " + result);
     if (result == "OK") {
-      long primaryProbeSuccesCount = primaryProbeSuccesses.incrementAndGet();
-      long primaryProbeConsecutiveCount = primaryProbeConsecutive.incrementAndGet(); 
-      System.out.println("+++++++++ Probe success count: " + primaryProbeSuccesCount + " Probe consecutive success count: " + primaryProbeConsecutiveCount + " Probe Total count: " + primaryProbeTotalCount);
-      if (primaryProbeConsecutiveCount > 40) {
+      long primaryProbeSuccessCount = primaryProbeSuccesses.incrementAndGet();
+      System.out.println("+++++++++ Probe success count: " + primaryProbeSuccessCount);
+      if (primaryProbeSuccessCount >= options.getMinPrimaryProbeSuccessCount()) {
         inFallbackMode = false;
         System.out.println("$$$$$$$$$$ Recovering to directpath $$$$$$$$$$$$$");
-        primaryProbeConsecutive.getAndSet(0);
+        primaryProbeSuccesses.getAndSet(0);
       }
     } else {
-      long primaryProbeErrorCount = primaryProbeErrors.incrementAndGet();
       System.out.println("------- Reseting probe success count ---------");
-      primaryProbeConsecutive.getAndSet(0);
+      primaryProbeSuccesses.getAndSet(0);
     }
     // Report metric based on result.
     openTelemetry.getModule().reportProbeResult(options.getPrimaryChannelName(), result);
@@ -335,6 +327,35 @@ public class GcpFallbackChannel extends ManagedChannel {
 
     return primaryChannel.authority();
   }
+
+  @Override
+  public io.grpc.ConnectivityState getState(boolean requestConnection) {
+    if (isInFallbackMode()) {
+      if (fallbackDelegateChannel != null) {
+        return fallbackDelegateChannel.getState(requestConnection);
+      }
+      return io.grpc.ConnectivityState.SHUTDOWN;
+    }
+    
+    if (primaryDelegateChannel != null) {
+      return primaryDelegateChannel.getState(requestConnection);
+    }
+    return io.grpc.ConnectivityState.SHUTDOWN;
+  }
+
+  @Override
+  public void notifyWhenStateChanged(io.grpc.ConnectivityState source, Runnable callback) {
+    if (isInFallbackMode()) {
+      if (fallbackDelegateChannel != null) {
+        fallbackDelegateChannel.notifyWhenStateChanged(source, callback);
+      }
+    } else {
+      if (primaryDelegateChannel != null) {
+        primaryDelegateChannel.notifyWhenStateChanged(source, callback);
+      }
+    }
+  }
+
 
   @Override
   public ManagedChannel shutdown() {

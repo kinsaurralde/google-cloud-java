@@ -26,6 +26,7 @@ import java.time.Duration;
 import java.util.EnumSet;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.concurrent.ScheduledExecutorService;
 
 public class GcpFallbackChannelOptions {
   private final boolean enableFallback;
@@ -37,9 +38,11 @@ public class GcpFallbackChannelOptions {
   private final Function<Channel, String> fallbackProbingFunction;
   private final Duration primaryProbingInterval;
   private final Duration fallbackProbingInterval;
+  private final int minPrimaryProbeSuccessCount;
   private final String primaryChannelName;
   private final String fallbackChannelName;
   private final GcpFallbackOpenTelemetry openTelemetry;
+  private final ScheduledExecutorService sharedExecutorService;
 
   public GcpFallbackChannelOptions(Builder builder) {
     this.enableFallback = builder.enableFallback;
@@ -51,9 +54,11 @@ public class GcpFallbackChannelOptions {
     this.fallbackProbingFunction = builder.fallbackProbingFunction;
     this.primaryProbingInterval = builder.primaryProbingInterval;
     this.fallbackProbingInterval = builder.fallbackProbingInterval;
+    this.minPrimaryProbeSuccessCount = builder.minPrimaryProbeSuccessCount;
     this.primaryChannelName = builder.primaryChannelName;
     this.fallbackChannelName = builder.fallbackChannelName;
     this.openTelemetry = builder.openTelemetry;
+    this.sharedExecutorService = builder.sharedExecutorService;
   }
 
   public static Builder newBuilder() {
@@ -96,6 +101,10 @@ public class GcpFallbackChannelOptions {
     return fallbackProbingInterval;
   }
 
+  public int getMinPrimaryProbeSuccessCount() {
+    return minPrimaryProbeSuccessCount;
+  }
+
   public String getPrimaryChannelName() {
     return primaryChannelName;
   }
@@ -121,11 +130,15 @@ public class GcpFallbackChannelOptions {
 
     private Duration primaryProbingInterval = Duration.ofMinutes(1);
     private Duration fallbackProbingInterval = Duration.ofMinutes(15);
+    
+    private int minPrimaryProbeSuccessCount = 10;
 
     private String primaryChannelName = "primary";
     private String fallbackChannelName = "fallback";
 
     private GcpFallbackOpenTelemetry openTelemetry = null;
+
+    private ScheduledExecutorService sharedExecutorService = null;
 
     public Builder() {}
 
@@ -184,6 +197,11 @@ public class GcpFallbackChannelOptions {
       return this;
     }
 
+    public Builder setMinPrimaryProbeSuccessCount(int minPrimaryProbeSuccessCount) {
+      this.minPrimaryProbeSuccessCount = minPrimaryProbeSuccessCount;
+      return this;
+    }
+
     public Builder setPrimaryChannelName(String primaryChannelName) {
       this.primaryChannelName = primaryChannelName;
       return this;
@@ -196,6 +214,11 @@ public class GcpFallbackChannelOptions {
 
     public Builder setGcpFallbackOpenTelemetry(GcpFallbackOpenTelemetry openTelemetry) {
       this.openTelemetry = openTelemetry;
+      return this;
+    }
+
+    public Builder setSharedExecutorService(ScheduledExecutorService sharedExecutorService) {
+      this.sharedExecutorService = sharedExecutorService;
       return this;
     }
 
