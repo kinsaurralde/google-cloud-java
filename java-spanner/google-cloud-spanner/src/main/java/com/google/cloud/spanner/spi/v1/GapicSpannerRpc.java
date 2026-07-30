@@ -308,6 +308,7 @@ public class GapicSpannerRpc implements SpannerRpc {
   private final GetSessionProbe getSessionProbe = new GetSessionProbe();
 
 
+
   public static GapicSpannerRpc create(SpannerOptions options) {
     return new GapicSpannerRpc(options);
   }
@@ -596,7 +597,8 @@ public class GapicSpannerRpc implements SpannerRpc {
         .setPeriod(Duration.ofMinutes(3))
         .setGcpFallbackOpenTelemetry(fallbackTelemetry)
         .setPrimaryProbingFunction(getSessionProbe)
-        .setPrimaryProbingInterval(Duration.ofSeconds(30))
+        .setPrimaryProbingInterval(Duration.ofSeconds(10))
+        .setMinPrimaryProbeSuccessCount(50)
         .build();
   }
 
@@ -642,7 +644,7 @@ public class GapicSpannerRpc implements SpannerRpc {
     }
   }
 
-  private void setupGcpFallback(
+    private void setupGcpFallback(
       InstantiatingGrpcChannelProvider.Builder defaultChannelProviderBuilder,
       final SpannerOptions options,
       final HeaderProvider headerProviderWithUserAgent,
@@ -694,24 +696,6 @@ public class GapicSpannerRpc implements SpannerRpc {
             builder = existingConfigurator.apply(builder);
           }
 
-          ManagedChannelBuilder<?> primaryBuilder = builder;
-          ManagedChannelBuilder<?> fallbackBuilder = cloudPathBuilder;
-          if (options.isGrpcGcpExtensionEnabled()) {
-            String jsonApiConfig = parseGrpcGcpApiConfig();
-            GcpManagedChannelOptions gcpOptions = grpcGcpOptionsWithMetricsAndDcp(options);
-            if (gcpOptions == null) {
-              gcpOptions = GcpManagedChannelOptions.newBuilder().build();
-            }
-            primaryBuilder =
-                GcpManagedChannelBuilder.forDelegateBuilder(builder)
-                    .withApiConfigJsonString(jsonApiConfig)
-                    .withOptions(gcpOptions);
-            fallbackBuilder =
-                GcpManagedChannelBuilder.forDelegateBuilder(cloudPathBuilder)
-                    .withApiConfigJsonString(jsonApiConfig)
-                    .withOptions(gcpOptions);
-          }
-
           GcpFallbackOpenTelemetry fallbackTelemetry =
               GcpFallbackOpenTelemetry.newBuilder()
                   .withSdk(getFallbackOpenTelemetry(options))
@@ -719,8 +703,24 @@ public class GapicSpannerRpc implements SpannerRpc {
                   .enableMetrics(Arrays.asList("fallback_count", "call_status"))
                   .build();
 
-          return new FallbackChannelBuilder(
-              primaryBuilder, fallbackBuilder, createFallbackChannelOptions(fallbackTelemetry, 1));
+          // 1. Wrap the raw connection builder and the cloudPathBuilder inside the Fallback wrapper
+          FallbackChannelBuilder fallbackDelegate = new FallbackChannelBuilder(
+              builder, cloudPathBuilder, createFallbackChannelOptions(fallbackTelemetry, 1));
+
+          // 2. Put grpc-gcp (GcpManagedChannelBuilder) on TOP of the fallback wrapper!
+          if (options.isGrpcGcpExtensionEnabled()) {
+            String jsonApiConfig = parseGrpcGcpApiConfig();
+            GcpManagedChannelOptions gcpOptions = grpcGcpOptionsWithMetricsAndDcp(options);
+            if (gcpOptions == null) {
+              gcpOptions = GcpManagedChannelOptions.newBuilder().build();
+            }
+            // grpc-gcp will now call fallbackDelegate.build() 8 times to populate its pool
+            return GcpManagedChannelBuilder.forDelegateBuilder(fallbackDelegate)
+                .withApiConfigJsonString(jsonApiConfig)
+                .withOptions(gcpOptions);
+          }
+
+          return fallbackDelegate;
         });
   }
 
@@ -751,6 +751,7 @@ public class GapicSpannerRpc implements SpannerRpc {
             // commit GRPC calls succeed
             .setKeepAliveTimeDuration(options.getGrpcKeepAliveTime())
             .setKeepAliveTimeoutDuration(options.getGrpcKeepAliveTimeout())
+            .setKeepAliveWithoutCalls(true)
 
             // Then check if SpannerOptions provides an InterceptorProvider. Create a default
             // SpannerInterceptorProvider if none is provided
@@ -2588,10 +2589,6 @@ public class GapicSpannerRpc implements SpannerRpc {
     private final java.util.concurrent.atomic.AtomicReference<String> sessionName =
         new java.util.concurrent.atomic.AtomicReference<>(null);
 
-    // Counter to rotate the keys across cycles
-    private final java.util.concurrent.atomic.AtomicInteger affinityCounter = 
-        new java.util.concurrent.atomic.AtomicInteger(0);
-
     public void setSessionName(String name) {
       System.out.println("@@@@@@@@@@@@@@ Setting session name for GetSession Probe @@@@@@@@@@@@@@");
       this.sessionName.set(name);
@@ -2605,7 +2602,6 @@ public class GapicSpannerRpc implements SpannerRpc {
       }
 
       try {
-        System.out.println("@@@@@@@@@@@@@@ Sending GetSession Probes @@@@@@@@@@@@@@");
         com.google.spanner.v1.GetSessionRequest request =
             com.google.spanner.v1.GetSessionRequest.newBuilder().setName(name).build();
 
@@ -2623,64 +2619,34 @@ public class GapicSpannerRpc implements SpannerRpc {
           }
         }
 
-        java.util.List<com.google.common.util.concurrent.ListenableFuture<com.google.spanner.v1.Session>> futures = 
-            new java.util.ArrayList<>();
+        // NO LOOPS, NO FUTURES, NO AFFINITY KEYS!
+        // Just fire a single RPC directly on the single channel provided
+        com.google.spanner.v1.SpannerGrpc.SpannerBlockingStub stub =
+            com.google.spanner.v1.SpannerGrpc.newBlockingStub(channel)
+                .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(metadata))
+                // Keep the 150s deadline so gRPC keep-alive has time to kill dead sockets
+                .withDeadlineAfter(150, java.util.concurrent.TimeUnit.SECONDS);
 
-        // Grab the starting key for this 30-second cycle
-        int startKey = Math.abs(affinityCounter.getAndAdd(8));
-
-        // Launch exactly 8 concurrent probes, but use the rotating keys!
-        for (int i = 0; i < 8; i++) {
-          // Cycle safely between 0 and 39
-          int currentAffinity = (startKey + i) % 40;
-
-          com.google.spanner.v1.SpannerGrpc.SpannerFutureStub stub =
-              com.google.spanner.v1.SpannerGrpc.newFutureStub(channel)
-                  .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(metadata))
-                  .withOption(GcpManagedChannel.AFFINITY_KEY, String.valueOf(currentAffinity))
-                  .withDeadlineAfter(10, java.util.concurrent.TimeUnit.SECONDS);
-
-          if (callCredentialsProvider != null) {
-            io.grpc.CallCredentials creds = callCredentialsProvider.getCallCredentials();
-            if (creds != null) {
-              stub = stub.withCallCredentials(creds);
-            }
-          }
-          futures.add(stub.getSession(request));
-        }
-
-        boolean allSucceeded = true;
-        String lastError = "ERROR";
-
-        // Wait for all concurrent probes to finish and log their specific affinity keys
-        for (int i = 0; i < futures.size(); i++) {
-          int currentAffinity = (startKey + i) % 40;
-          try {
-            futures.get(i).get(); 
-            System.out.println("GetSession Probe OK for AFFINITY_KEY: " + currentAffinity);
-          } catch (java.util.concurrent.ExecutionException e) {
-            allSucceeded = false;
-            Throwable cause = e.getCause();
-            if (cause instanceof io.grpc.StatusRuntimeException) {
-               lastError = ((io.grpc.StatusRuntimeException) cause).getStatus().getCode().name();
-               System.out.println("Probe FAILED with " + lastError + " for AFFINITY_KEY " + currentAffinity);
-            } else {
-               System.out.println("Probe FAILED with ERROR for AFFINITY_KEY " + currentAffinity);
-            }
+        if (callCredentialsProvider != null) {
+          io.grpc.CallCredentials creds = callCredentialsProvider.getCallCredentials();
+          if (creds != null) {
+            stub = stub.withCallCredentials(creds);
           }
         }
 
-        if (allSucceeded) {
-          return "OK";
-        } else {
-          return lastError;
-        }
+        stub.getSession(request);
+        System.out.println("GetSession Probe OK for single channel!");
 
+        return "OK";
+      } catch (io.grpc.StatusRuntimeException e) {
+        System.out.println("Probe FAILED with " + e.getStatus().getCode().name());
+        return e.getStatus().getCode().name();
       } catch (Exception e) {
         return "ERROR";
       }
     }
   }
+
 
 
 
