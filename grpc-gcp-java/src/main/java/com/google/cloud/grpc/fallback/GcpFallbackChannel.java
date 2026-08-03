@@ -33,8 +33,8 @@ import io.grpc.MethodDescriptor;
 import io.grpc.Status;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
 
@@ -50,15 +50,13 @@ public class GcpFallbackChannel extends ManagedChannel {
   private final Channel primaryChannel;
   // Wrapped fallback channel to be used for RPCs.
   private final Channel fallbackChannel;
-  private final AtomicLong primarySuccesses = new AtomicLong(0);
-  private final AtomicLong primaryFailures = new AtomicLong(0);
-  private final AtomicLong primaryProbeSuccesses = new AtomicLong(0);
-  private final AtomicLong fallbackSuccesses = new AtomicLong(0);
-  private final AtomicLong fallbackFailures = new AtomicLong(0);
-  private boolean inFallbackMode = false;
+  private final GcpFallbackState fallbackState;
+  private final boolean ownsFallbackState;
   private final GcpFallbackOpenTelemetry openTelemetry;
 
   private final ScheduledExecutorService execService;
+  private ScheduledFuture<?> primaryProbeFuture = null;
+  private ScheduledFuture<?> fallbackProbeFuture = null;
 
   public GcpFallbackChannel(
       GcpFallbackChannelOptions options,
@@ -80,17 +78,19 @@ public class GcpFallbackChannel extends ManagedChannel {
       ManagedChannelBuilder<?> primaryChannelBuilder,
       ManagedChannelBuilder<?> fallbackChannelBuilder,
       ScheduledExecutorService execService) {
-    System.out.println("************* Using Local GcpFallbackChannel *************^");
+    System.out.println("[kinsaurralde] ************* Using Local GcpFallbackChannel *************^");
     checkNotNull(options);
     checkNotNull(primaryChannelBuilder);
     checkNotNull(fallbackChannelBuilder);
-    if (execService != null) {
-      this.execService = execService;
-    } else {
-      this.execService =
-          Executors.newScheduledThreadPool(3, GcpThreadFactory.newThreadFactory("gcp-fallback-%d"));
-    }
     this.options = options;
+    if (options.getSharedState() != null) {
+      this.fallbackState = options.getSharedState();
+      this.ownsFallbackState = false;
+    } else {
+      this.fallbackState = new GcpFallbackState(); // Private state for backward compatibility
+      this.ownsFallbackState = true;
+    }
+    this.execService = fallbackState.getOrCreateExecutorService(execService, options);
     if (options.getGcpOpenTelemetry() != null) {
       this.openTelemetry = options.getGcpOpenTelemetry();
     } else {
@@ -151,13 +151,15 @@ public class GcpFallbackChannel extends ManagedChannel {
     checkNotNull(options);
     checkNotNull(primaryChannel);
     checkNotNull(fallbackChannel);
-    if (execService != null) {
-      this.execService = execService;
-    } else {
-      this.execService =
-          Executors.newScheduledThreadPool(3, GcpThreadFactory.newThreadFactory("gcp-fallback-%d"));
-    }
     this.options = options;
+    if (options.getSharedState() != null) {
+      this.fallbackState = options.getSharedState();
+      this.ownsFallbackState = false;
+    } else {
+      this.fallbackState = new GcpFallbackState(); // Private state for backward compatibility
+      this.ownsFallbackState = true;
+    }
+    this.execService = fallbackState.getOrCreateExecutorService(execService, options);
     if (options.getGcpOpenTelemetry() != null) {
       this.openTelemetry = options.getGcpOpenTelemetry();
     } else {
@@ -177,122 +179,73 @@ public class GcpFallbackChannel extends ManagedChannel {
   }
 
   public boolean isInFallbackMode() {
-    return inFallbackMode || primaryChannel == null;
+    return (fallbackState.getInFallbackMode().get() && fallbackChannel != null)
+        || primaryChannel == null;
   }
 
   private void init() {
     if (options.getPrimaryProbingFunction() != null) {
-      execService.scheduleWithFixedDelay(
-          this::probePrimary,
-          options.getPrimaryProbingInterval().toMillis(),
-          options.getPrimaryProbingInterval().toMillis(),
-          MILLISECONDS);
+      this.primaryProbeFuture =
+          fallbackState.scheduleTask(
+              this::probePrimary,
+              options.getPrimaryProbingInterval().toMillis(),
+              options.getPrimaryProbingInterval().toMillis(),
+              MILLISECONDS);
     }
 
     if (options.getFallbackProbingFunction() != null) {
-      execService.scheduleAtFixedRate(
-          this::probeFallback,
-          options.getFallbackProbingInterval().toMillis(),
-          options.getFallbackProbingInterval().toMillis(),
-          MILLISECONDS);
+      this.fallbackProbeFuture =
+          fallbackState.scheduleTask(
+              this::probeFallback,
+              options.getFallbackProbingInterval().toMillis(),
+              options.getFallbackProbingInterval().toMillis(),
+              MILLISECONDS);
     }
 
-    if (options.isEnableFallback()
-        && options.getPeriod() != null
-        && options.getPeriod().toMillis() > 0) {
-      execService.scheduleAtFixedRate(
-          this::checkErrorRates,
-          options.getPeriod().toMillis(),
-          options.getPeriod().toMillis(),
-          MILLISECONDS);
-    }
+    fallbackState.startPeriodicEvaluation(options, execService);
   }
 
   private void checkErrorRates() {
-    long successes = primarySuccesses.getAndSet(0);
-    long failures = primaryFailures.getAndSet(0);
-    float errRate = 0f;
-    System.out.println("isInFallbackMode: " + isInFallbackMode());
-    if (failures + successes > 0) {
-      errRate = (float) failures / (failures + successes);
-    }
-    // Report primary error rate.
-    openTelemetry.getModule().reportErrorRate(options.getPrimaryChannelName(), errRate);
-
-    if (!isInFallbackMode() && options.isEnableFallback() && fallbackChannel != null) {
-      if (failures >= options.getMinFailedCalls() && errRate >= options.getErrorRateThreshold()) {
-        if (inFallbackMode != true) {
-          openTelemetry
-              .getModule()
-              .reportFallback(options.getPrimaryChannelName(), options.getFallbackChannelName());
-        }
-        System.out.println("&&&&&&&&& Switching to fallback &&&&&&&&&&");
-        inFallbackMode = true;
-      }
-    }
-    successes = fallbackSuccesses.getAndSet(0);
-    failures = fallbackFailures.getAndSet(0);
-    errRate = 0f;
-    if (failures + successes > 0) {
-      errRate = (float) failures / (failures + successes);
-    }
-    // Report fallback error rate.
-    openTelemetry.getModule().reportErrorRate(options.getFallbackChannelName(), errRate);
-
-    openTelemetry
-        .getModule()
-        .reportCurrentChannel(options.getPrimaryChannelName(), inFallbackMode == false);
-    openTelemetry
-        .getModule()
-        .reportCurrentChannel(options.getFallbackChannelName(), inFallbackMode == true);
+    fallbackState.checkErrorRates(options, openTelemetry);
   }
 
   private void processPrimaryStatusCode(Status.Code statusCode) {
     if (options.getErroneousStates().contains(statusCode)) {
-      // Count error.
-      primaryFailures.incrementAndGet();
+      fallbackState.getPrimaryFailures().incrementAndGet();
     } else {
-      // Count success.
-      primarySuccesses.incrementAndGet();
+      fallbackState.getPrimarySuccesses().incrementAndGet();
     }
-    // Report status code.
     openTelemetry.getModule().reportStatus(options.getPrimaryChannelName(), statusCode);
   }
 
   private void processFallbackStatusCode(Status.Code statusCode) {
     if (options.getErroneousStates().contains(statusCode)) {
-      // Count error.
-      fallbackFailures.incrementAndGet();
+      fallbackState.getFallbackFailures().incrementAndGet();
     } else {
-      // Count success.
-      fallbackSuccesses.incrementAndGet();
+      fallbackState.getFallbackSuccesses().incrementAndGet();
     }
-    // Report status code.
     openTelemetry.getModule().reportStatus(options.getFallbackChannelName(), statusCode);
   }
 
   private void probePrimary() {
-    if (!isInFallbackMode()) {
-      return;
-    }
     String result = "";
     if (primaryDelegateChannel == null) {
       result = INIT_FAILURE_REASON;
     } else {
       result = options.getPrimaryProbingFunction().apply(primaryDelegateChannel);
     }
-    System.out.println("DEBUG: [PRIMARY PROBE] Result " + result);
-    if (result == "OK") {
-      long primaryProbeSuccessCount = primaryProbeSuccesses.incrementAndGet();
-      System.out.println("+++++++++ Probe success count: " + primaryProbeSuccessCount);
+    System.out.println("[kinsaurralde] DEBUG: [PRIMARY PROBE] Result " + result);
+    if ("OK".equals(result)) {
+      long primaryProbeSuccessCount = fallbackState.getPrimaryProbeSuccesses().incrementAndGet();
+      System.out.println("[kinsaurralde] +++++++++ Shared probe success count: " + primaryProbeSuccessCount);
       if (primaryProbeSuccessCount >= options.getMinPrimaryProbeSuccessCount()) {
-        inFallbackMode = false;
-        System.out.println("$$$$$$$$$$ Recovering to directpath $$$$$$$$$$$$$");
-        primaryProbeSuccesses.getAndSet(0);
+        fallbackState.getInFallbackMode().set(false);
+        System.out.println("[kinsaurralde] $$$$$$$$$$ Recovering to directpath $$$$$$$$$$$$$");
+        fallbackState.getPrimaryProbeSuccesses().set(0);
       }
     } else {
-      System.out.println("------- Reseting probe success count ---------");
-      primaryProbeSuccesses.getAndSet(0);
+      System.out.println("[kinsaurralde] ------- Resetting shared probe success count ---------");
+      fallbackState.getPrimaryProbeSuccesses().set(0);
     }
     // Report metric based on result.
     openTelemetry.getModule().reportProbeResult(options.getPrimaryChannelName(), result);
@@ -336,7 +289,7 @@ public class GcpFallbackChannel extends ManagedChannel {
       }
       return io.grpc.ConnectivityState.SHUTDOWN;
     }
-    
+
     if (primaryDelegateChannel != null) {
       return primaryDelegateChannel.getState(requestConnection);
     }
@@ -356,28 +309,43 @@ public class GcpFallbackChannel extends ManagedChannel {
     }
   }
 
-
   @Override
   public ManagedChannel shutdown() {
+    if (primaryProbeFuture != null) {
+      primaryProbeFuture.cancel(false);
+    }
+    if (fallbackProbeFuture != null) {
+      fallbackProbeFuture.cancel(false);
+    }
     if (primaryDelegateChannel != null) {
       primaryDelegateChannel.shutdown();
     }
     if (fallbackDelegateChannel != null) {
       fallbackDelegateChannel.shutdown();
     }
-    execService.shutdown();
+    if (ownsFallbackState) {
+      fallbackState.shutdown();
+    }
     return this;
   }
 
   @Override
   public ManagedChannel shutdownNow() {
+    if (primaryProbeFuture != null) {
+      primaryProbeFuture.cancel(true);
+    }
+    if (fallbackProbeFuture != null) {
+      fallbackProbeFuture.cancel(true);
+    }
     if (primaryDelegateChannel != null) {
       primaryDelegateChannel.shutdownNow();
     }
     if (fallbackDelegateChannel != null) {
       fallbackDelegateChannel.shutdownNow();
     }
-    execService.shutdownNow();
+    if (ownsFallbackState) {
+      fallbackState.shutdownNow();
+    }
     return this;
   }
 

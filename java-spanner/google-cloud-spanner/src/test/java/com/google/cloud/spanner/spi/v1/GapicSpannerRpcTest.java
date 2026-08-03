@@ -1421,8 +1421,8 @@ public class GapicSpannerRpcTest {
       GrpcGcpObjectCounts before = countGrpcGcpObjectsFromChannelz();
       rpc = new GapicSpannerRpc(options);
       GrpcGcpObjectCounts counts = countGrpcGcpObjectsFromChannelz().minus(before);
-      assertEquals(counts.debugString(), 6, counts.gcpManagedChannels);
-      assertEquals(counts.debugString(), 48, counts.channelRefs);
+      assertEquals(counts.debugString(), 3, counts.gcpManagedChannels);
+      assertEquals(counts.debugString(), 24, counts.channelRefs);
     } finally {
       if (rpc != null) {
         rpc.shutdown();

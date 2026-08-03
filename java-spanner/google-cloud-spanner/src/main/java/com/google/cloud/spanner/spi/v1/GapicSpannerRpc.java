@@ -258,6 +258,9 @@ public class GapicSpannerRpc implements SpannerRpc {
   public static boolean DIRECTPATH_CHANNEL_CREATED = false;
   private static final String API_FILE = "grpc-gcp-apiconfig.json";
 
+  private final com.google.cloud.grpc.fallback.GcpFallbackState sharedFallbackState =
+      new com.google.cloud.grpc.fallback.GcpFallbackState();
+
   private final RequestIdCreator requestIdCreator = new RequestIdCreatorImpl();
   private boolean rpcIsClosed;
   private final SpannerStub spannerStub;
@@ -318,7 +321,7 @@ public class GapicSpannerRpc implements SpannerRpc {
   }
 
   GapicSpannerRpc(final SpannerOptions options, boolean initializeStubs) {
-    System.out.println("################# Using Local Cloud Spanner Client #################^");
+    System.out.println("[kinsaurralde] ################# Using Local Cloud Spanner Client #################^");
     this.projectId = options.getProjectId();
     String projectNameStr = PROJECT_NAME_TEMPLATE.instantiate("project", this.projectId);
     try {
@@ -599,6 +602,7 @@ public class GapicSpannerRpc implements SpannerRpc {
         .setPrimaryProbingFunction(getSessionProbe)
         .setPrimaryProbingInterval(Duration.ofSeconds(10))
         .setMinPrimaryProbeSuccessCount(50)
+        .setSharedState(this.sharedFallbackState)
         .build();
   }
 
@@ -2590,7 +2594,7 @@ public class GapicSpannerRpc implements SpannerRpc {
         new java.util.concurrent.atomic.AtomicReference<>(null);
 
     public void setSessionName(String name) {
-      System.out.println("@@@@@@@@@@@@@@ Setting session name for GetSession Probe @@@@@@@@@@@@@@");
+      System.out.println("[kinsaurralde] @@@@@@@@@@@@@@ Setting session name for GetSession Probe @@@@@@@@@@@@@@");
       this.sessionName.set(name);
     }
 
@@ -2619,13 +2623,11 @@ public class GapicSpannerRpc implements SpannerRpc {
           }
         }
 
-        // NO LOOPS, NO FUTURES, NO AFFINITY KEYS!
-        // Just fire a single RPC directly on the single channel provided
+        // Direct synchronous probe RPC executed on the specific underlying channel.
         com.google.spanner.v1.SpannerGrpc.SpannerBlockingStub stub =
             com.google.spanner.v1.SpannerGrpc.newBlockingStub(channel)
                 .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(metadata))
-                // Keep the 150s deadline so gRPC keep-alive has time to kill dead sockets
-                .withDeadlineAfter(150, java.util.concurrent.TimeUnit.SECONDS);
+                .withDeadlineAfter(10, java.util.concurrent.TimeUnit.SECONDS);
 
         if (callCredentialsProvider != null) {
           io.grpc.CallCredentials creds = callCredentialsProvider.getCallCredentials();
@@ -2635,22 +2637,17 @@ public class GapicSpannerRpc implements SpannerRpc {
         }
 
         stub.getSession(request);
-        System.out.println("GetSession Probe OK for single channel!");
+        System.out.println("[kinsaurralde] GetSession Probe OK for single channel!");
 
         return "OK";
       } catch (io.grpc.StatusRuntimeException e) {
-        System.out.println("Probe FAILED with " + e.getStatus().getCode().name());
+        System.out.println("[kinsaurralde] Probe FAILED with " + e.getStatus().getCode().name());
         return e.getStatus().getCode().name();
       } catch (Exception e) {
         return "ERROR";
       }
     }
   }
-
-
-
-
-
 
   // Wrapper class to build the GcpFallbackChannel using GAX's configuration
   private static class FallbackChannelBuilder

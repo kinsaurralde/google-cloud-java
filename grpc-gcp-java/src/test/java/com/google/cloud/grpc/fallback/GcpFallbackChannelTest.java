@@ -1286,4 +1286,186 @@ public class GcpFallbackChannelTest {
                 new GcpFallbackChannel(
                     getDefaultOptions(), mockPrimaryInvalidBuilder, mockFallbackInvalidBuilder));
   }
+
+  @SuppressWarnings({"unchecked"})
+  private void simulateCallOnChannel(
+      GcpFallbackChannel channel,
+      Status statusToReturn,
+      ManagedChannel primaryDelegate,
+      ManagedChannel fallbackDelegate,
+      ClientCall<Object, Object> primaryCall,
+      ClientCall<Object, Object> fallbackCall,
+      boolean expectFallbackRouting) {
+    final ClientCall.Listener<Object> dummyCallListener = mock(ClientCall.Listener.class);
+    final Metadata requestHeaders = new Metadata();
+
+    ClientCall<Object, Object> testCall = channel.newCall(methodDescriptor, callOptions);
+    assertNotNull(testCall);
+
+    ClientCall<Object, Object> targetCall;
+    if (expectFallbackRouting) {
+      verify(fallbackDelegate).newCall(methodDescriptor, callOptions);
+      verify(primaryDelegate, never()).newCall(methodDescriptor, callOptions);
+      targetCall = fallbackCall;
+    } else {
+      verify(primaryDelegate).newCall(methodDescriptor, callOptions);
+      verify(fallbackDelegate, never()).newCall(methodDescriptor, callOptions);
+      targetCall = primaryCall;
+    }
+
+    testCall.start(dummyCallListener, requestHeaders);
+
+    ArgumentCaptor<ClientCall.Listener<Object>> delegateListenerCaptor =
+        ArgumentCaptor.forClass(ClientCall.Listener.class);
+    verify(targetCall).start(delegateListenerCaptor.capture(), eq(requestHeaders));
+    delegateListenerCaptor.getValue().onClose(statusToReturn, new Metadata());
+
+    clearInvocations(primaryDelegate, fallbackDelegate, targetCall);
+  }
+
+  @Test
+  public void testSharedState_singleEvaluationScheduled() {
+    GcpFallbackState sharedState = new GcpFallbackState();
+    GcpFallbackChannelOptions options =
+        getDefaultOptionsBuilder().setSharedState(sharedState).build();
+
+    ScheduledExecutorService mockExec1 = mock(ScheduledExecutorService.class);
+    ScheduledExecutorService mockExec2 = mock(ScheduledExecutorService.class);
+
+    GcpFallbackChannel channel1 =
+        new GcpFallbackChannel(options, mockPrimaryBuilder, mockFallbackBuilder, mockExec1);
+    GcpFallbackChannel channel2 =
+        new GcpFallbackChannel(options, mockPrimaryBuilder, mockFallbackBuilder, mockExec2);
+
+    try {
+      // Periodic evaluation was started on mockExec1 by the shared state
+      verify(mockExec1)
+          .scheduleAtFixedRate(
+              any(Runnable.class),
+              eq(options.getPeriod().toMillis()),
+              eq(options.getPeriod().toMillis()),
+              eq(MILLISECONDS));
+
+      // Channel 2 sharing the same state did NOT schedule a duplicate evaluation loop
+      verify(mockExec2, never())
+          .scheduleAtFixedRate(
+              any(Runnable.class),
+              eq(options.getPeriod().toMillis()),
+              eq(options.getPeriod().toMillis()),
+              eq(MILLISECONDS));
+    } finally {
+      channel1.shutdownNow();
+      channel2.shutdownNow();
+    }
+  }
+
+  @Test
+  public void testSharedState_coordinatedFailover() {
+    GcpFallbackState sharedState = new GcpFallbackState();
+    GcpFallbackChannelOptions options =
+        getDefaultOptionsBuilder()
+            .setSharedState(sharedState)
+            .setMinFailedCalls(3)
+            .setErrorRateThreshold(0.5f)
+            .build();
+
+    ScheduledExecutorService mockExec1 = mock(ScheduledExecutorService.class);
+    ScheduledExecutorService mockExec2 = mock(ScheduledExecutorService.class);
+
+    ArgumentCaptor<Runnable> taskCaptor = ArgumentCaptor.forClass(Runnable.class);
+
+    GcpFallbackChannel channel1 =
+        new GcpFallbackChannel(options, mockPrimaryBuilder, mockFallbackBuilder, mockExec1);
+    GcpFallbackChannel channel2 =
+        new GcpFallbackChannel(options, mockPrimaryBuilder, mockFallbackBuilder, mockExec2);
+
+    try {
+      verify(mockExec1)
+          .scheduleAtFixedRate(
+              taskCaptor.capture(),
+              eq(options.getPeriod().toMillis()),
+              eq(options.getPeriod().toMillis()),
+              eq(MILLISECONDS));
+      Runnable checkErrorRates = taskCaptor.getValue();
+
+      // Both channels initially in primary mode
+      assertFalse(channel1.isInFallbackMode());
+      assertFalse(channel2.isInFallbackMode());
+
+      // Channel 1 processes 2 failures, Channel 2 processes 1 failure (total 3 failures on shared state)
+      simulateCallOnChannel(
+          channel1,
+          Status.UNAVAILABLE,
+          mockPrimaryDelegateChannel,
+          mockFallbackDelegateChannel,
+          mockPrimaryClientCall,
+          mockFallbackClientCall,
+          false);
+      simulateCallOnChannel(
+          channel1,
+          Status.UNAVAILABLE,
+          mockPrimaryDelegateChannel,
+          mockFallbackDelegateChannel,
+          mockPrimaryClientCall,
+          mockFallbackClientCall,
+          false);
+      simulateCallOnChannel(
+          channel2,
+          Status.UNAVAILABLE,
+          mockPrimaryDelegateChannel,
+          mockFallbackDelegateChannel,
+          mockPrimaryClientCall,
+          mockFallbackClientCall,
+          false);
+
+      // Run checkErrorRates on shared state
+      checkErrorRates.run();
+
+      // Both channels must now be in fallback mode
+      assertTrue(channel1.isInFallbackMode());
+      assertTrue(channel2.isInFallbackMode());
+
+      // Subsequent call on Channel 2 routes to fallback channel
+      simulateCallOnChannel(
+          channel2,
+          Status.OK,
+          mockPrimaryDelegateChannel,
+          mockFallbackDelegateChannel,
+          mockPrimaryClientCall,
+          mockFallbackClientCall,
+          true);
+    } finally {
+      channel1.shutdownNow();
+      channel2.shutdownNow();
+    }
+  }
+
+  @Test
+  public void testSharedState_channelShutdownLeavesSiblingChannelsFunctional() {
+    GcpFallbackState sharedState = new GcpFallbackState();
+    GcpFallbackChannelOptions options =
+        getDefaultOptionsBuilder().setSharedState(sharedState).build();
+
+    ScheduledExecutorService mockExec1 = mock(ScheduledExecutorService.class);
+    ScheduledExecutorService mockExec2 = mock(ScheduledExecutorService.class);
+
+    GcpFallbackChannel channel1 =
+        new GcpFallbackChannel(options, mockPrimaryBuilder, mockFallbackBuilder, mockExec1);
+    GcpFallbackChannel channel2 =
+        new GcpFallbackChannel(options, mockPrimaryBuilder, mockFallbackBuilder, mockExec2);
+
+    try {
+      // Shutting down channel1 does not shut down the shared executor while sibling channels are active
+      channel1.shutdown();
+      verify(mockExec1, never()).shutdown();
+
+      // Channel 2 can still transition and read shared fallback state
+      sharedState.getInFallbackMode().set(true);
+      assertTrue(channel2.isInFallbackMode());
+    } finally {
+      channel2.shutdownNow();
+      sharedState.shutdown();
+      verify(mockExec1).shutdown();
+    }
+  }
 }

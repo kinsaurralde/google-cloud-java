@@ -25,8 +25,8 @@ import io.grpc.Status;
 import java.time.Duration;
 import java.util.EnumSet;
 import java.util.Set;
-import java.util.function.Function;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.Function;
 
 public class GcpFallbackChannelOptions {
   private final boolean enableFallback;
@@ -43,6 +43,7 @@ public class GcpFallbackChannelOptions {
   private final String fallbackChannelName;
   private final GcpFallbackOpenTelemetry openTelemetry;
   private final ScheduledExecutorService sharedExecutorService;
+  private final GcpFallbackState sharedState;
 
   public GcpFallbackChannelOptions(Builder builder) {
     this.enableFallback = builder.enableFallback;
@@ -59,6 +60,7 @@ public class GcpFallbackChannelOptions {
     this.fallbackChannelName = builder.fallbackChannelName;
     this.openTelemetry = builder.openTelemetry;
     this.sharedExecutorService = builder.sharedExecutorService;
+    this.sharedState = builder.sharedState;
   }
 
   public static Builder newBuilder() {
@@ -117,6 +119,14 @@ public class GcpFallbackChannelOptions {
     return openTelemetry;
   }
 
+  public ScheduledExecutorService getSharedExecutorService() {
+    return sharedExecutorService;
+  }
+
+  public GcpFallbackState getSharedState() {
+    return sharedState;
+  }
+
   public static class Builder {
     private boolean enableFallback = true;
     private float errorRateThreshold = 1f;
@@ -130,15 +140,15 @@ public class GcpFallbackChannelOptions {
 
     private Duration primaryProbingInterval = Duration.ofMinutes(1);
     private Duration fallbackProbingInterval = Duration.ofMinutes(15);
-    
+
     private int minPrimaryProbeSuccessCount = 10;
 
     private String primaryChannelName = "primary";
     private String fallbackChannelName = "fallback";
 
     private GcpFallbackOpenTelemetry openTelemetry = null;
-
     private ScheduledExecutorService sharedExecutorService = null;
+    private GcpFallbackState sharedState = null;
 
     public Builder() {}
 
@@ -219,6 +229,11 @@ public class GcpFallbackChannelOptions {
 
     public Builder setSharedExecutorService(ScheduledExecutorService sharedExecutorService) {
       this.sharedExecutorService = sharedExecutorService;
+      return this;
+    }
+
+    public Builder setSharedState(GcpFallbackState sharedState) {
+      this.sharedState = sharedState;
       return this;
     }
 
