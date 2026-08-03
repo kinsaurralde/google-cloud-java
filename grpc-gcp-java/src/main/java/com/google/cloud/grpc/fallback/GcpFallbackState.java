@@ -36,6 +36,7 @@ public class GcpFallbackState {
   private final AtomicLong fallbackSuccesses = new AtomicLong(0);
   private final AtomicLong fallbackFailures = new AtomicLong(0);
   private final AtomicLong primaryProbeSuccesses = new AtomicLong(0);
+  private final AtomicLong firstPrimaryProbeSuccessNanos = new AtomicLong(0);
   private final AtomicBoolean inFallbackMode = new AtomicBoolean(false);
   private final AtomicBoolean evaluationStarted = new AtomicBoolean(false);
 
@@ -61,6 +62,10 @@ public class GcpFallbackState {
 
   public AtomicLong getPrimaryProbeSuccesses() {
     return primaryProbeSuccesses;
+  }
+
+  public AtomicLong getFirstPrimaryProbeSuccessNanos() {
+    return firstPrimaryProbeSuccessNanos;
   }
 
   public AtomicBoolean getInFallbackMode() {

@@ -39,6 +39,7 @@ public class GcpFallbackChannelOptions {
   private final Duration primaryProbingInterval;
   private final Duration fallbackProbingInterval;
   private final int minPrimaryProbeSuccessCount;
+  private final Duration minPrimaryProbeSuccessDuration;
   private final String primaryChannelName;
   private final String fallbackChannelName;
   private final GcpFallbackOpenTelemetry openTelemetry;
@@ -56,6 +57,7 @@ public class GcpFallbackChannelOptions {
     this.primaryProbingInterval = builder.primaryProbingInterval;
     this.fallbackProbingInterval = builder.fallbackProbingInterval;
     this.minPrimaryProbeSuccessCount = builder.minPrimaryProbeSuccessCount;
+    this.minPrimaryProbeSuccessDuration = builder.minPrimaryProbeSuccessDuration;
     this.primaryChannelName = builder.primaryChannelName;
     this.fallbackChannelName = builder.fallbackChannelName;
     this.openTelemetry = builder.openTelemetry;
@@ -107,6 +109,10 @@ public class GcpFallbackChannelOptions {
     return minPrimaryProbeSuccessCount;
   }
 
+  public Duration getMinPrimaryProbeSuccessDuration() {
+    return minPrimaryProbeSuccessDuration;
+  }
+
   public String getPrimaryChannelName() {
     return primaryChannelName;
   }
@@ -142,6 +148,7 @@ public class GcpFallbackChannelOptions {
     private Duration fallbackProbingInterval = Duration.ofMinutes(15);
 
     private int minPrimaryProbeSuccessCount = 10;
+    private Duration minPrimaryProbeSuccessDuration = Duration.ZERO;
 
     private String primaryChannelName = "primary";
     private String fallbackChannelName = "fallback";
@@ -209,6 +216,11 @@ public class GcpFallbackChannelOptions {
 
     public Builder setMinPrimaryProbeSuccessCount(int minPrimaryProbeSuccessCount) {
       this.minPrimaryProbeSuccessCount = minPrimaryProbeSuccessCount;
+      return this;
+    }
+
+    public Builder setMinPrimaryProbeSuccessDuration(Duration minPrimaryProbeSuccessDuration) {
+      this.minPrimaryProbeSuccessDuration = minPrimaryProbeSuccessDuration;
       return this;
     }
 

@@ -183,6 +183,11 @@ public class GcpFallbackChannel extends ManagedChannel {
         || primaryChannel == null;
   }
 
+  @VisibleForTesting
+  GcpFallbackState getFallbackState() {
+    return fallbackState;
+  }
+
   private void init() {
     if (options.getPrimaryProbingFunction() != null) {
       this.primaryProbeFuture =
@@ -228,6 +233,9 @@ public class GcpFallbackChannel extends ManagedChannel {
   }
 
   private void probePrimary() {
+    if (!fallbackState.getInFallbackMode().get() && primaryChannel != null) {
+      return;
+    }
     String result = "";
     if (primaryDelegateChannel == null) {
       result = INIT_FAILURE_REASON;
@@ -236,16 +244,29 @@ public class GcpFallbackChannel extends ManagedChannel {
     }
     System.out.println("[kinsaurralde] DEBUG: [PRIMARY PROBE] Result " + result);
     if ("OK".equals(result)) {
+      fallbackState.getFirstPrimaryProbeSuccessNanos().compareAndSet(0, System.nanoTime());
+      long firstSuccessNanos = fallbackState.getFirstPrimaryProbeSuccessNanos().get();
       long primaryProbeSuccessCount = fallbackState.getPrimaryProbeSuccesses().incrementAndGet();
       System.out.println("[kinsaurralde] +++++++++ Shared probe success count: " + primaryProbeSuccessCount);
-      if (primaryProbeSuccessCount >= options.getMinPrimaryProbeSuccessCount()) {
+
+      boolean durationSatisfied = true;
+      if (options.getMinPrimaryProbeSuccessDuration() != null
+          && !options.getMinPrimaryProbeSuccessDuration().isZero()
+          && !options.getMinPrimaryProbeSuccessDuration().isNegative()) {
+        long elapsedNanos = System.nanoTime() - firstSuccessNanos;
+        durationSatisfied = elapsedNanos >= options.getMinPrimaryProbeSuccessDuration().toNanos();
+      }
+
+      if (primaryProbeSuccessCount >= options.getMinPrimaryProbeSuccessCount() && durationSatisfied) {
         fallbackState.getInFallbackMode().set(false);
         System.out.println("[kinsaurralde] $$$$$$$$$$ Recovering to directpath $$$$$$$$$$$$$");
         fallbackState.getPrimaryProbeSuccesses().set(0);
+        fallbackState.getFirstPrimaryProbeSuccessNanos().set(0);
       }
     } else {
       System.out.println("[kinsaurralde] ------- Resetting shared probe success count ---------");
       fallbackState.getPrimaryProbeSuccesses().set(0);
+      fallbackState.getFirstPrimaryProbeSuccessNanos().set(0);
     }
     // Report metric based on result.
     openTelemetry.getModule().reportProbeResult(options.getPrimaryChannelName(), result);

@@ -329,7 +329,7 @@ public class GapicSpannerRpc implements SpannerRpc {
   }
 
   GapicSpannerRpc(final SpannerOptions options, boolean initializeStubs) {
-    System.out.println("[kinsaurralde] ################# Using Local Cloud Spanner Client #################^");
+    System.out.println("[kinsaurralde] #################2 Using Local Cloud Spanner Client #################^2");
     this.projectId = options.getProjectId();
     String projectNameStr = PROJECT_NAME_TEMPLATE.instantiate("project", this.projectId);
     try {
@@ -610,6 +610,7 @@ public class GapicSpannerRpc implements SpannerRpc {
         .setPrimaryProbingFunction(getSessionProbe)
         .setPrimaryProbingInterval(Duration.ofSeconds(10))
         .setMinPrimaryProbeSuccessCount(50)
+        .setMinPrimaryProbeSuccessDuration(Duration.ofMinutes(10))
         .setSharedState(this.sharedFallbackState)
         .build();
   }
@@ -2467,6 +2468,7 @@ public class GapicSpannerRpc implements SpannerRpc {
       this.instanceAdminStub.close();
       this.databaseAdminStub.close();
       this.spannerWatchdog.shutdown();
+      this.sharedFallbackState.shutdown();
 
       try {
         this.spannerStub.awaitTermination(10L, TimeUnit.SECONDS);
@@ -2488,6 +2490,7 @@ public class GapicSpannerRpc implements SpannerRpc {
     this.instanceAdminStub.close();
     this.databaseAdminStub.close();
     this.spannerWatchdog.shutdown();
+    this.sharedFallbackState.shutdownNow();
 
     this.spannerStub.shutdownNow();
     this.partitionedDmlStub.shutdownNow();
