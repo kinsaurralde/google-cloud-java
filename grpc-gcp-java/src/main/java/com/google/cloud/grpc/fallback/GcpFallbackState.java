@@ -23,6 +23,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Logger;
 
 /**
  * Shared thread-safe state container for coordinated pool-wide failover, recovery, and background tasks.
@@ -31,12 +32,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * consolidating probing and error evaluation threads across the entire channel pool.
  */
 public class GcpFallbackState {
+  private static final Logger logger = Logger.getLogger(GcpFallbackState.class.getName());
   private final AtomicLong primarySuccesses = new AtomicLong(0);
   private final AtomicLong primaryFailures = new AtomicLong(0);
   private final AtomicLong fallbackSuccesses = new AtomicLong(0);
   private final AtomicLong fallbackFailures = new AtomicLong(0);
-  private final AtomicLong primaryProbeSuccesses = new AtomicLong(0);
-  private final AtomicLong firstPrimaryProbeSuccessNanos = new AtomicLong(0);
   private final AtomicBoolean inFallbackMode = new AtomicBoolean(false);
   private final AtomicBoolean evaluationStarted = new AtomicBoolean(false);
 
@@ -58,14 +58,6 @@ public class GcpFallbackState {
 
   public AtomicLong getFallbackFailures() {
     return fallbackFailures;
-  }
-
-  public AtomicLong getPrimaryProbeSuccesses() {
-    return primaryProbeSuccesses;
-  }
-
-  public AtomicLong getFirstPrimaryProbeSuccessNanos() {
-    return firstPrimaryProbeSuccessNanos;
   }
 
   public AtomicBoolean getInFallbackMode() {
@@ -153,7 +145,6 @@ public class GcpFallbackState {
     long successes = primarySuccesses.getAndSet(0);
     long failures = primaryFailures.getAndSet(0);
     float errRate = 0f;
-    System.out.println("[kinsaurralde] isInFallbackMode: " + inFallbackMode.get());
     if (failures + successes > 0) {
       errRate = (float) failures / (failures + successes);
     }
@@ -164,7 +155,7 @@ public class GcpFallbackState {
     if (!inFallbackMode.get() && options.isEnableFallback()) {
       if (failures >= options.getMinFailedCalls() && errRate >= options.getErrorRateThreshold()) {
         inFallbackMode.set(true); // Coordinated instant pool-wide switch
-        System.out.println("[kinsaurralde] &&&&&&&&& Switching to fallback &&&&&&&&&&");
+        logger.info("[kinsaurralde] Primary error rate threshold crossed. Switching pool to fallback mode.");
         if (openTelemetry != null && openTelemetry.getModule() != null) {
           openTelemetry
               .getModule()

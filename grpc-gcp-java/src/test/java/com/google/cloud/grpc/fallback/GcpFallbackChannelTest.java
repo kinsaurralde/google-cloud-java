@@ -41,6 +41,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -1504,12 +1505,12 @@ public class GcpFallbackChannelTest {
       // Probe 1: Success, but count < 2 and duration not yet met
       probeTask.run();
       assertTrue(channel.isInFallbackMode());
-      assertEquals(1, sharedState.getPrimaryProbeSuccesses().get());
+      assertEquals(1, channel.getLocalProbeSuccesses().get());
 
       // Probe 2 immediately: count == 2, but duration (50ms) not elapsed yet!
       probeTask.run();
       assertTrue(channel.isInFallbackMode());
-      assertEquals(2, sharedState.getPrimaryProbeSuccesses().get());
+      assertEquals(2, channel.getLocalProbeSuccesses().get());
 
       // Wait for duration window to pass
       Thread.sleep(60);
@@ -1517,8 +1518,7 @@ public class GcpFallbackChannelTest {
       // Probe 3: count >= 2 and duration >= 50ms satisfied -> Recover!
       probeTask.run();
       assertFalse(channel.isInFallbackMode());
-      assertEquals(0, sharedState.getPrimaryProbeSuccesses().get());
-      assertEquals(0, sharedState.getFirstPrimaryProbeSuccessNanos().get());
+      assertEquals(0, channel.getLocalProbeSuccesses().get());
     } finally {
       channel.shutdownNow();
       sharedState.shutdown();
@@ -1554,16 +1554,14 @@ public class GcpFallbackChannelTest {
               eq(MILLISECONDS));
       Runnable probeTask = taskCaptor.getValue();
 
-      // Successful probe initializes firstPrimaryProbeSuccessNanos
+      // Successful probe initializes local probe counter
       probeTask.run();
-      assertEquals(1, sharedState.getPrimaryProbeSuccesses().get());
-      assertTrue(sharedState.getFirstPrimaryProbeSuccessNanos().get() > 0);
+      assertEquals(1, channel.getLocalProbeSuccesses().get());
 
-      // Failing probe resets both count and timestamp to 0
+      // Failing probe resets local probe count to 0
       probeOk.set(false);
       probeTask.run();
-      assertEquals(0, sharedState.getPrimaryProbeSuccesses().get());
-      assertEquals(0, sharedState.getFirstPrimaryProbeSuccessNanos().get());
+      assertEquals(0, channel.getLocalProbeSuccesses().get());
       assertTrue(channel.isInFallbackMode());
     } finally {
       channel.shutdownNow();
@@ -1606,9 +1604,64 @@ public class GcpFallbackChannelTest {
       assertFalse(channel.isInFallbackMode());
       probeTask.run();
       assertEquals(0, probeCalls.get());
-      assertEquals(0, sharedState.getPrimaryProbeSuccesses().get());
+      assertEquals(0, channel.getLocalProbeSuccesses().get());
     } finally {
       channel.shutdownNow();
+      sharedState.shutdown();
+    }
+  }
+
+  @Test
+  public void testPerChannelIndependentRecovery_oneChannelRecoversWhileOtherStaysInFallback() {
+    GcpFallbackState sharedState = new GcpFallbackState();
+    sharedState.getInFallbackMode().set(true); // Pool-wide fallback active
+
+    GcpFallbackChannelOptions options1 =
+        getDefaultOptionsBuilder()
+            .setSharedState(sharedState)
+            .setPrimaryProbingFunction(channel -> "OK")
+            .setMinPrimaryProbeSuccessCount(1)
+            .setMinPrimaryProbeSuccessDuration(Duration.ZERO)
+            .build();
+
+    GcpFallbackChannelOptions options2 =
+        getDefaultOptionsBuilder()
+            .setSharedState(sharedState)
+            .setPrimaryProbingFunction(channel -> "UNAVAILABLE")
+            .setMinPrimaryProbeSuccessCount(1)
+            .setMinPrimaryProbeSuccessDuration(Duration.ZERO)
+            .build();
+
+    ScheduledExecutorService mockExec1 = mock(ScheduledExecutorService.class);
+    ScheduledExecutorService mockExec2 = mock(ScheduledExecutorService.class);
+    ArgumentCaptor<Runnable> taskCaptor1 = ArgumentCaptor.forClass(Runnable.class);
+
+    GcpFallbackChannel channel1 =
+        new GcpFallbackChannel(options1, mockPrimaryBuilder, mockFallbackBuilder, mockExec1);
+    GcpFallbackChannel channel2 =
+        new GcpFallbackChannel(options2, mockPrimaryBuilder, mockFallbackBuilder, mockExec2);
+
+    try {
+      verify(mockExec1, atLeastOnce())
+          .scheduleAtFixedRate(
+              taskCaptor1.capture(),
+              eq(options1.getPrimaryProbingInterval().toMillis()),
+              eq(options1.getPrimaryProbingInterval().toMillis()),
+              eq(MILLISECONDS));
+      Runnable probeTask1 = taskCaptor1.getAllValues().get(0);
+
+      assertTrue(channel1.isInFallbackMode());
+      assertTrue(channel2.isInFallbackMode());
+
+      // Run probe on channel 1 -> channel 1 recovers to DirectPath
+      probeTask1.run();
+
+      assertFalse("Channel 1 should recover to DirectPath", channel1.isInFallbackMode());
+      assertTrue("Channel 2 should remain in CloudPath fallback mode", channel2.isInFallbackMode());
+      assertFalse("Global fallback should be unlatched", sharedState.getInFallbackMode().get());
+    } finally {
+      channel1.shutdownNow();
+      channel2.shutdownNow();
       sharedState.shutdown();
     }
   }

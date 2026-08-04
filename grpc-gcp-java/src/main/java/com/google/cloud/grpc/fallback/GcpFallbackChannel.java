@@ -35,6 +35,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
 
@@ -53,6 +55,10 @@ public class GcpFallbackChannel extends ManagedChannel {
   private final GcpFallbackState fallbackState;
   private final boolean ownsFallbackState;
   private final GcpFallbackOpenTelemetry openTelemetry;
+
+  private final AtomicBoolean localInFallbackMode = new AtomicBoolean(false);
+  private final AtomicLong localProbeSuccesses = new AtomicLong(0);
+  private final AtomicLong localFirstPrimaryProbeSuccessNanos = new AtomicLong(0);
 
   private final ScheduledExecutorService execService;
   private ScheduledFuture<?> primaryProbeFuture = null;
@@ -78,7 +84,6 @@ public class GcpFallbackChannel extends ManagedChannel {
       ManagedChannelBuilder<?> primaryChannelBuilder,
       ManagedChannelBuilder<?> fallbackChannelBuilder,
       ScheduledExecutorService execService) {
-    System.out.println("[kinsaurralde] ************* Using Local GcpFallbackChannel *************^");
     checkNotNull(options);
     checkNotNull(primaryChannelBuilder);
     checkNotNull(fallbackChannelBuilder);
@@ -179,13 +184,29 @@ public class GcpFallbackChannel extends ManagedChannel {
   }
 
   public boolean isInFallbackMode() {
-    return (fallbackState.getInFallbackMode().get() && fallbackChannel != null)
+    if (fallbackState.getInFallbackMode().get()) {
+      if (localInFallbackMode.compareAndSet(false, true)) {
+        localProbeSuccesses.set(0);
+        localFirstPrimaryProbeSuccessNanos.set(0);
+      }
+    }
+    return (localInFallbackMode.get() && fallbackChannel != null)
         || primaryChannel == null;
   }
 
   @VisibleForTesting
   GcpFallbackState getFallbackState() {
     return fallbackState;
+  }
+
+  @VisibleForTesting
+  AtomicBoolean getLocalInFallbackMode() {
+    return localInFallbackMode;
+  }
+
+  @VisibleForTesting
+  AtomicLong getLocalProbeSuccesses() {
+    return localProbeSuccesses;
   }
 
   private void init() {
@@ -233,7 +254,13 @@ public class GcpFallbackChannel extends ManagedChannel {
   }
 
   private void probePrimary() {
-    if (!fallbackState.getInFallbackMode().get() && primaryChannel != null) {
+    if (fallbackState.getInFallbackMode().get()) {
+      if (localInFallbackMode.compareAndSet(false, true)) {
+        localProbeSuccesses.set(0);
+        localFirstPrimaryProbeSuccessNanos.set(0);
+      }
+    }
+    if (!localInFallbackMode.get() && primaryChannel != null) {
       return;
     }
     String result = "";
@@ -242,12 +269,10 @@ public class GcpFallbackChannel extends ManagedChannel {
     } else {
       result = options.getPrimaryProbingFunction().apply(primaryDelegateChannel);
     }
-    System.out.println("[kinsaurralde] DEBUG: [PRIMARY PROBE] Result " + result);
     if ("OK".equals(result)) {
-      fallbackState.getFirstPrimaryProbeSuccessNanos().compareAndSet(0, System.nanoTime());
-      long firstSuccessNanos = fallbackState.getFirstPrimaryProbeSuccessNanos().get();
-      long primaryProbeSuccessCount = fallbackState.getPrimaryProbeSuccesses().incrementAndGet();
-      System.out.println("[kinsaurralde] +++++++++ Shared probe success count: " + primaryProbeSuccessCount);
+      localFirstPrimaryProbeSuccessNanos.compareAndSet(0, System.nanoTime());
+      long firstSuccessNanos = localFirstPrimaryProbeSuccessNanos.get();
+      long primaryProbeSuccessCount = localProbeSuccesses.incrementAndGet();
 
       boolean durationSatisfied = true;
       if (options.getMinPrimaryProbeSuccessDuration() != null
@@ -259,14 +284,15 @@ public class GcpFallbackChannel extends ManagedChannel {
 
       if (primaryProbeSuccessCount >= options.getMinPrimaryProbeSuccessCount() && durationSatisfied) {
         fallbackState.getInFallbackMode().set(false);
-        System.out.println("[kinsaurralde] $$$$$$$$$$ Recovering to directpath $$$$$$$$$$$$$");
-        fallbackState.getPrimaryProbeSuccesses().set(0);
-        fallbackState.getFirstPrimaryProbeSuccessNanos().set(0);
+        localInFallbackMode.set(false);
+        logger.info("[kinsaurralde] Primary channel recovered to DirectPath.");
+        localProbeSuccesses.set(0);
+        localFirstPrimaryProbeSuccessNanos.set(0);
       }
     } else {
-      System.out.println("[kinsaurralde] ------- Resetting shared probe success count ---------");
-      fallbackState.getPrimaryProbeSuccesses().set(0);
-      fallbackState.getFirstPrimaryProbeSuccessNanos().set(0);
+      localInFallbackMode.set(true);
+      localProbeSuccesses.set(0);
+      localFirstPrimaryProbeSuccessNanos.set(0);
     }
     // Report metric based on result.
     openTelemetry.getModule().reportProbeResult(options.getPrimaryChannelName(), result);
