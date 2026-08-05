@@ -611,7 +611,6 @@ public class GapicSpannerRpc implements SpannerRpc {
         .setPrimaryProbingInterval(Duration.ofSeconds(10))
         .setMinPrimaryProbeSuccessCount(50)
         .setMinPrimaryProbeSuccessDuration(Duration.ofMinutes(10))
-        .setSharedState(this.sharedFallbackState)
         .build();
   }
 
@@ -716,24 +715,40 @@ public class GapicSpannerRpc implements SpannerRpc {
                   .enableMetrics(Arrays.asList("fallback_count", "call_status"))
                   .build();
 
-          // 1. Wrap the raw connection builder and the cloudPathBuilder inside the Fallback wrapper
-          FallbackChannelBuilder fallbackDelegate = new FallbackChannelBuilder(
-              builder, cloudPathBuilder, createFallbackChannelOptions(fallbackTelemetry, 1));
+          String eefMode = System.getenv("EEF_MODE");
+          if (eefMode == null || eefMode.isEmpty()) {
+            eefMode = System.getenv("EEF_LEVEL");
+          }
 
-          // 2. Put grpc-gcp (GcpManagedChannelBuilder) on TOP of the fallback wrapper!
           if (options.isGrpcGcpExtensionEnabled()) {
             String jsonApiConfig = parseGrpcGcpApiConfig();
             GcpManagedChannelOptions gcpOptions = grpcGcpOptionsWithMetricsAndDcp(options);
             if (gcpOptions == null) {
               gcpOptions = GcpManagedChannelOptions.newBuilder().build();
             }
-            // grpc-gcp will now call fallbackDelegate.build() 8 times to populate its pool
-            return GcpManagedChannelBuilder.forDelegateBuilder(fallbackDelegate)
-                .withApiConfigJsonString(jsonApiConfig)
-                .withOptions(gcpOptions);
+
+            if ("pool".equalsIgnoreCase(eefMode)) {
+              // Pool level EEF: 1 GcpFallbackChannel wraps the entire GcpManagedChannel pool
+              ManagedChannelBuilder gcpDirectPathBuilder =
+                  GcpManagedChannelBuilder.forDelegateBuilder(builder)
+                      .withApiConfigJsonString(jsonApiConfig)
+                      .withOptions(gcpOptions);
+
+              return new FallbackChannelBuilder(
+                  gcpDirectPathBuilder, cloudPathBuilder, createFallbackChannelOptions(fallbackTelemetry, 1));
+            } else {
+              // Channel level EEF (Hybrid): GcpManagedChannel holds pool of GcpFallbackChannels
+              FallbackChannelBuilder fallbackDelegate = new FallbackChannelBuilder(
+                  builder, cloudPathBuilder, createFallbackChannelOptions(fallbackTelemetry, 1));
+
+              return GcpManagedChannelBuilder.forDelegateBuilder(fallbackDelegate)
+                  .withApiConfigJsonString(jsonApiConfig)
+                  .withOptions(gcpOptions);
+            }
           }
 
-          return fallbackDelegate;
+          return new FallbackChannelBuilder(
+              builder, cloudPathBuilder, createFallbackChannelOptions(fallbackTelemetry, 1));
         });
   }
 
@@ -2636,10 +2651,41 @@ public class GapicSpannerRpc implements SpannerRpc {
           }
         }
 
+        final java.util.concurrent.atomic.AtomicReference<io.grpc.Attributes> capturedAttributes =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
+        io.grpc.ClientInterceptor attributeInterceptor =
+            new io.grpc.ClientInterceptor() {
+              @Override
+              public <ReqT, RespT> io.grpc.ClientCall<ReqT, RespT> interceptCall(
+                  io.grpc.MethodDescriptor<ReqT, RespT> method,
+                  io.grpc.CallOptions callOptions,
+                  io.grpc.Channel next) {
+                io.grpc.ClientCall<ReqT, RespT> call = next.newCall(method, callOptions);
+                return new io.grpc.ForwardingClientCall.SimpleForwardingClientCall<ReqT, RespT>(call) {
+                  @Override
+                  public void start(Listener<RespT> responseListener, io.grpc.Metadata headers) {
+                    super.start(
+                        new io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener<RespT>(
+                            responseListener) {
+                          @Override
+                          public void onHeaders(io.grpc.Metadata headers) {
+                            capturedAttributes.set(call.getAttributes());
+                            super.onHeaders(headers);
+                          }
+                        },
+                        headers);
+                  }
+                };
+              }
+            };
+
         // Direct synchronous probe RPC executed on the specific underlying channel.
         com.google.spanner.v1.SpannerGrpc.SpannerBlockingStub stub =
             com.google.spanner.v1.SpannerGrpc.newBlockingStub(channel)
-                .withInterceptors(io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(metadata))
+                .withInterceptors(
+                    io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(metadata),
+                    attributeInterceptor)
                 .withDeadlineAfter(10, java.util.concurrent.TimeUnit.SECONDS);
 
         if (callCredentialsProvider != null) {
@@ -2650,8 +2696,20 @@ public class GapicSpannerRpc implements SpannerRpc {
         }
 
         stub.getSession(request);
-        System.out.println("[kinsaurralde] GetSession Probe OK for single channel!");
 
+        io.grpc.Attributes attrs = capturedAttributes.get();
+        if (attrs != null) {
+          java.net.SocketAddress remoteAddr = attrs.get(io.grpc.Grpc.TRANSPORT_ATTR_REMOTE_ADDR);
+          if (!isDirectPathTransport(remoteAddr, attrs)) {
+            System.out.println(
+                "[kinsaurralde] Probe succeeded but NOT using DirectPath transport (remoteAddr: "
+                    + remoteAddr
+                    + ")");
+            return "NOT_DIRECTPATH";
+          }
+        }
+
+        System.out.println("[kinsaurralde] GetSession Probe OK for single channel (DirectPath verified)!");
         return "OK";
       } catch (io.grpc.StatusRuntimeException e) {
         System.out.println("[kinsaurralde] Probe FAILED with " + e.getStatus().getCode().name());
@@ -2659,6 +2717,17 @@ public class GapicSpannerRpc implements SpannerRpc {
       } catch (Exception e) {
         return "ERROR";
       }
+    }
+
+    private boolean isDirectPathTransport(
+        java.net.SocketAddress remoteAddr, io.grpc.Attributes attrs) {
+      // DirectPath (both IPv4 and IPv6) uses ALTS security handshaking.
+      // CloudPath (GFE) uses standard TLS/SSL certificates.
+      Object sslSession = attrs.get(io.grpc.Grpc.TRANSPORT_ATTR_SSL_SESSION);
+      if (sslSession != null) {
+        return false; // Standard TLS session indicates GFE (CloudPath)
+      }
+      return true; // ALTS transport indicates DirectPath (IPv4 or IPv6)
     }
   }
 
