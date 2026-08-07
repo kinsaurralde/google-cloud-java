@@ -23,6 +23,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Logger;
 
 /**
  * Shared thread-safe state container for coordinated pool-wide failover, recovery, and background
@@ -32,6 +33,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * consolidating probing and error evaluation threads across the entire channel pool.
  */
 public class GcpFallbackState {
+  private static final Logger logger = Logger.getLogger(GcpFallbackState.class.getName());
   private final AtomicLong primarySuccesses = new AtomicLong(0);
   private final AtomicLong primaryFailures = new AtomicLong(0);
   private final AtomicLong fallbackSuccesses = new AtomicLong(0);
@@ -154,6 +156,7 @@ public class GcpFallbackState {
     if (!inFallbackMode.get() && options.isEnableFallback()) {
       if (failures >= options.getMinFailedCalls() && errRate >= options.getErrorRateThreshold()) {
         inFallbackMode.set(true);
+        logger.info("[kinsaurralde] Primary error rate threshold crossed. Switching pool to fallback mode.");
         if (openTelemetry != null && openTelemetry.getModule() != null) {
           openTelemetry
               .getModule()
