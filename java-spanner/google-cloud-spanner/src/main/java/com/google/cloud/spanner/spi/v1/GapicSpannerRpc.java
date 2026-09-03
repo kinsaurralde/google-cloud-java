@@ -268,6 +268,9 @@ public class GapicSpannerRpc implements SpannerRpc {
 
   private static final String API_FILE = "grpc-gcp-apiconfig.json";
 
+  private final com.google.cloud.grpc.fallback.GcpFallbackState sharedFallbackState =
+      new com.google.cloud.grpc.fallback.GcpFallbackState();
+
   private final RequestIdCreator requestIdCreator = new RequestIdCreatorImpl();
   private boolean rpcIsClosed;
   private final SpannerStub spannerStub;
@@ -315,6 +318,9 @@ public class GapicSpannerRpc implements SpannerRpc {
 
   private final GrpcCallContext baseGrpcCallContext;
 
+  // Inside GapicSpannerRpc class fields
+  private final GetSessionProbe getSessionProbe = new GetSessionProbe();
+
   public static GapicSpannerRpc create(SpannerOptions options) {
     return new GapicSpannerRpc(options);
   }
@@ -324,6 +330,8 @@ public class GapicSpannerRpc implements SpannerRpc {
   }
 
   GapicSpannerRpc(final SpannerOptions options, boolean initializeStubs) {
+    System.out.println(
+        "[kinsaurralde] #################2 Using Local Cloud Spanner Client #################^2");
     this.projectId = options.getProjectId();
     String projectNameStr = PROJECT_NAME_TEMPLATE.instantiate("project", this.projectId);
     try {
@@ -595,14 +603,25 @@ public class GapicSpannerRpc implements SpannerRpc {
   }
 
   @VisibleForTesting
+  com.google.cloud.grpc.fallback.GcpFallbackState getSharedFallbackState() {
+    return sharedFallbackState;
+  }
+
+  @VisibleForTesting
   GcpFallbackChannelOptions createFallbackChannelOptions(
       GcpFallbackOpenTelemetry fallbackTelemetry, int minFailedCalls) {
     return GcpFallbackChannelOptions.newBuilder()
+        .setSharedState(sharedFallbackState)
         .setPrimaryChannelName("directpath")
         .setFallbackChannelName("cloudpath")
         .setMinFailedCalls(minFailedCalls)
         .setPeriod(Duration.ofMinutes(3))
         .setGcpFallbackOpenTelemetry(fallbackTelemetry)
+        .setPrimaryProbingFunction(getSessionProbe)
+        .setPrimaryProbingInterval(Duration.ofSeconds(10))
+        .setMinPrimaryProbeSuccessCount(50)
+        .setMinPrimaryProbeSuccessDuration(Duration.ofMinutes(10))
+        .setEnableRecovery(true)
         .build();
   }
 
@@ -700,26 +719,6 @@ public class GapicSpannerRpc implements SpannerRpc {
           if (existingConfigurator != null) {
             builder = existingConfigurator.apply(builder);
           }
-
-          ManagedChannelBuilder<?> primaryBuilder = builder;
-          ManagedChannelBuilder<?> fallbackBuilder = cloudPathBuilder;
-          if (options.isGrpcGcpExtensionEnabled()) {
-            String jsonApiConfig = parseGrpcGcpApiConfig();
-            GcpManagedChannelOptions gcpOptions =
-                grpcGcpOptionsWithMetricsAndDcp(options, channelPrimer);
-            if (gcpOptions == null) {
-              gcpOptions = GcpManagedChannelOptions.newBuilder().build();
-            }
-            primaryBuilder =
-                GcpManagedChannelBuilder.forDelegateBuilder(builder)
-                    .withApiConfigJsonString(jsonApiConfig)
-                    .withOptions(gcpOptions);
-            fallbackBuilder =
-                GcpManagedChannelBuilder.forDelegateBuilder(cloudPathBuilder)
-                    .withApiConfigJsonString(jsonApiConfig)
-                    .withOptions(gcpOptions);
-          }
-
           GcpFallbackOpenTelemetry fallbackTelemetry =
               GcpFallbackOpenTelemetry.newBuilder()
                   .withSdk(getFallbackOpenTelemetry(options))
@@ -727,8 +726,24 @@ public class GapicSpannerRpc implements SpannerRpc {
                   .enableMetrics(Arrays.asList("fallback_count", "call_status"))
                   .build();
 
-          return new FallbackChannelBuilder(
-              primaryBuilder, fallbackBuilder, createFallbackChannelOptions(fallbackTelemetry, 1));
+          FallbackChannelBuilder fallbackDelegate =
+              new FallbackChannelBuilder(
+                  builder, cloudPathBuilder, createFallbackChannelOptions(fallbackTelemetry, 1));
+
+          if (options.isGrpcGcpExtensionEnabled()) {
+            String jsonApiConfig = parseGrpcGcpApiConfig();
+            GcpManagedChannelOptions gcpOptions =
+                grpcGcpOptionsWithMetricsAndDcp(options, channelPrimer);
+            if (gcpOptions == null) {
+              gcpOptions = GcpManagedChannelOptions.newBuilder().build();
+            }
+
+            return GcpManagedChannelBuilder.forDelegateBuilder(fallbackDelegate)
+                .withApiConfigJsonString(jsonApiConfig)
+                .withOptions(gcpOptions);
+          }
+
+          return fallbackDelegate;
         });
   }
 
@@ -759,6 +774,7 @@ public class GapicSpannerRpc implements SpannerRpc {
             // commit GRPC calls succeed
             .setKeepAliveTimeDuration(options.getGrpcKeepAliveTime())
             .setKeepAliveTimeoutDuration(options.getGrpcKeepAliveTimeout())
+            .setKeepAliveWithoutCalls(true)
 
             // Then check if SpannerOptions provides an InterceptorProvider. Create a default
             // SpannerInterceptorProvider if none is provided
@@ -2057,7 +2073,15 @@ public class GapicSpannerRpc implements SpannerRpc {
     CreateSessionRequest request = requestBuilder.build();
     GrpcCallContext context =
         newCallContext(options, databaseName, request, SpannerGrpc.getCreateSessionMethod(), true);
-    return get(spannerStub.createSessionCallable().futureCall(request, context));
+    // Execute the call
+    Session session = get(spannerStub.createSessionCallable().futureCall(request, context));
+
+    // Capture the multiplexed session name for the prober
+    if (isMultiplexed && session != null) {
+      getSessionProbe.setSessionName(session.getName());
+    }
+
+    return session;
   }
 
   @Override
@@ -2548,6 +2572,7 @@ public class GapicSpannerRpc implements SpannerRpc {
       this.instanceAdminStub.close();
       this.databaseAdminStub.close();
       this.spannerWatchdog.shutdown();
+      this.sharedFallbackState.shutdown();
 
       try {
         this.spannerStub.awaitTermination(10L, TimeUnit.SECONDS);
@@ -2569,6 +2594,7 @@ public class GapicSpannerRpc implements SpannerRpc {
     this.instanceAdminStub.close();
     this.databaseAdminStub.close();
     this.spannerWatchdog.shutdown();
+    this.sharedFallbackState.shutdownNow();
 
     this.spannerStub.shutdownNow();
     this.partitionedDmlStub.shutdownNow();
@@ -2678,6 +2704,124 @@ public class GapicSpannerRpc implements SpannerRpc {
   private static Duration systemProperty(String name, int defaultValue) {
     String stringValue = System.getProperty(name, "");
     return Duration.ofSeconds(stringValue.isEmpty() ? defaultValue : Integer.parseInt(stringValue));
+  }
+
+  private class GetSessionProbe
+      implements com.google.common.base.Function<io.grpc.Channel, String> {
+    private final java.util.concurrent.atomic.AtomicReference<String> sessionName =
+        new java.util.concurrent.atomic.AtomicReference<>(null);
+
+    public void setSessionName(String name) {
+      System.out.println(
+          "[kinsaurralde] @@@@@@@@@@@@@@ Setting session name for GetSession Probe @@@@@@@@@@@@@@");
+      this.sessionName.set(name);
+    }
+
+    @Override
+    public String apply(io.grpc.Channel channel) {
+      String name = sessionName.get();
+      if (name == null) {
+        return "WAITING_FOR_REAL_SESSION";
+      }
+
+      try {
+        com.google.spanner.v1.GetSessionRequest request =
+            com.google.spanner.v1.GetSessionRequest.newBuilder().setName(name).build();
+
+        java.util.Map<String, java.util.List<String>> extraHeaders =
+            metadataProvider.newExtraHeaders(name, projectName);
+
+        io.grpc.Metadata metadata = new io.grpc.Metadata();
+        for (java.util.Map.Entry<String, java.util.List<String>> entry : extraHeaders.entrySet()) {
+          io.grpc.Metadata.Key<String> key =
+              io.grpc.Metadata.Key.of(entry.getKey(), io.grpc.Metadata.ASCII_STRING_MARSHALLER);
+          if (entry.getValue() != null) {
+            for (String value : entry.getValue()) {
+              metadata.put(key, value);
+            }
+          }
+        }
+
+        final java.util.concurrent.atomic.AtomicReference<io.grpc.Attributes> capturedAttributes =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
+        io.grpc.ClientInterceptor attributeInterceptor =
+            new io.grpc.ClientInterceptor() {
+              @Override
+              public <ReqT, RespT> io.grpc.ClientCall<ReqT, RespT> interceptCall(
+                  io.grpc.MethodDescriptor<ReqT, RespT> method,
+                  io.grpc.CallOptions callOptions,
+                  io.grpc.Channel next) {
+                io.grpc.ClientCall<ReqT, RespT> call = next.newCall(method, callOptions);
+                return new io.grpc.ForwardingClientCall.SimpleForwardingClientCall<ReqT, RespT>(
+                    call) {
+                  @Override
+                  public void start(Listener<RespT> responseListener, io.grpc.Metadata headers) {
+                    super.start(
+                        new io.grpc.ForwardingClientCallListener.SimpleForwardingClientCallListener<
+                            RespT>(responseListener) {
+                          @Override
+                          public void onHeaders(io.grpc.Metadata headers) {
+                            capturedAttributes.set(call.getAttributes());
+                            super.onHeaders(headers);
+                          }
+                        },
+                        headers);
+                  }
+                };
+              }
+            };
+
+        // Direct synchronous probe RPC executed on the specific underlying channel.
+        com.google.spanner.v1.SpannerGrpc.SpannerBlockingStub stub =
+            com.google.spanner.v1.SpannerGrpc.newBlockingStub(channel)
+                .withInterceptors(
+                    io.grpc.stub.MetadataUtils.newAttachHeadersInterceptor(metadata),
+                    attributeInterceptor)
+                .withDeadlineAfter(10, java.util.concurrent.TimeUnit.SECONDS);
+
+        if (callCredentialsProvider != null) {
+          io.grpc.CallCredentials creds = callCredentialsProvider.getCallCredentials();
+          if (creds != null) {
+            stub = stub.withCallCredentials(creds);
+          }
+        }
+
+        stub.getSession(request);
+
+        io.grpc.Attributes attrs = capturedAttributes.get();
+        if (attrs != null) {
+          java.net.SocketAddress remoteAddr = attrs.get(io.grpc.Grpc.TRANSPORT_ATTR_REMOTE_ADDR);
+          if (!isDirectPathTransport(remoteAddr, attrs)) {
+            System.out.println(
+                "[kinsaurralde] Probe succeeded but NOT using DirectPath transport (remoteAddr: "
+                    + remoteAddr
+                    + ")");
+            return "NOT_DIRECTPATH";
+          }
+        }
+
+        System.out.println(
+            "[kinsaurralde] GetSession Probe OK for single channel (DirectPath verified)!");
+        return "OK";
+      } catch (io.grpc.StatusRuntimeException e) {
+        System.out.println("[kinsaurralde] Probe FAILED with " + e.getStatus().getCode().name());
+        return e.getStatus().getCode().name();
+      } catch (Exception e) {
+        return "ERROR";
+      }
+    }
+
+    private boolean isDirectPathTransport(
+        java.net.SocketAddress remoteAddr, io.grpc.Attributes attrs) {
+      // DirectPath (both IPv4 and IPv6) uses ALTS security handshaking.
+      // CloudPath (GFE) uses standard TLS/SSL certificates.
+      Object sslSession = attrs.get(io.grpc.Grpc.TRANSPORT_ATTR_SSL_SESSION);
+      if (sslSession != null) {
+        return false; // Standard TLS session indicates GFE (CloudPath)
+      }
+      return true; // ALTS transport indicates DirectPath (IPv4 or IPv6)
+    }
   }
 
   // Wrapper class to build the GcpFallbackChannel using GAX's configuration

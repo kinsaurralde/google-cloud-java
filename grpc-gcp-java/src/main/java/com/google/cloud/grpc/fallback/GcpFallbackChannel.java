@@ -303,6 +303,7 @@ public class GcpFallbackChannel extends ManagedChannel {
           && durationSatisfied) {
         fallbackState.getInFallbackMode().set(false);
         localInFallbackMode.set(false);
+        logger.info("[kinsaurralde] Primary channel recovered to DirectPath.");
         localProbeSuccesses.set(0);
         localFirstPrimaryProbeSuccessNanos.set(0);
       }
