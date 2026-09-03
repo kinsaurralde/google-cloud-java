@@ -379,17 +379,17 @@ public class GapicSpannerRpc implements SpannerRpc {
     if (initializeStubs) {
       CredentialsProvider credentialsProvider =
           GrpcTransportOptions.setUpCredentialsProvider(options);
-      this.channelPrimer = createChannelPrimer(options, credentialsProvider);
+      boolean useGcpFallback =
+          options.getChannelProvider() == null
+              && isEnableDirectAccess
+              && options.isEnableGcpFallback();
+      this.channelPrimer = createChannelPrimer(options, credentialsProvider, useGcpFallback);
 
       InstantiatingGrpcChannelProvider.Builder defaultChannelProviderBuilder =
           createBaseChannelProviderBuilder(
               options, headerProviderWithUserAgent, isEnableDirectAccess);
       GrpcGcpEndpointChannelConfigurator endpointChannelConfigurator =
           createGrpcGcpEndpointChannelConfigurator(defaultChannelProviderBuilder, options);
-      boolean useGcpFallback =
-          options.getChannelProvider() == null
-              && isEnableDirectAccess
-              && options.isEnableGcpFallback();
       if (useGcpFallback) {
         setupGcpFallback(
             defaultChannelProviderBuilder,
@@ -821,10 +821,9 @@ public class GapicSpannerRpc implements SpannerRpc {
    */
   @Nullable
   private DynamicChannelPoolPrimer createChannelPrimer(
-      SpannerOptions options, CredentialsProvider credentialsProvider) {
+      SpannerOptions options, CredentialsProvider credentialsProvider, boolean useGcpFallback) {
     if (!options.isGrpcGcpExtensionEnabled()
-        || (!options.isDynamicChannelPoolEnabled()
-            && !Boolean.TRUE.equals(options.isEnableGcpFallback()))) {
+        || (!options.isDynamicChannelPoolEnabled() && !useGcpFallback)) {
       return null;
     }
     return new DynamicChannelPoolPrimer(
