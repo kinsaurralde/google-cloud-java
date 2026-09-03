@@ -1880,8 +1880,8 @@ public class GapicSpannerRpcTest {
       GrpcGcpObjectCounts before = countGrpcGcpObjectsFromChannelz();
       rpc = new GapicSpannerRpc(options);
       GrpcGcpObjectCounts counts = countGrpcGcpObjectsFromChannelz().minus(before);
-      assertEquals(counts.debugString(), 6, counts.gcpManagedChannels);
-      assertEquals(counts.debugString(), 48, counts.channelRefs);
+      assertEquals(counts.debugString(), 3, counts.gcpManagedChannels);
+      assertEquals(counts.debugString(), 24, counts.channelRefs);
     } finally {
       if (rpc != null) {
         rpc.shutdown();
@@ -2047,6 +2047,7 @@ public class GapicSpannerRpcTest {
         GcpFallbackOpenTelemetry fallbackTelemetry, int minFailedCalls) {
       // Override default 1-minute period to 10ms for instant testing
       return GcpFallbackChannelOptions.newBuilder()
+          .setSharedState(getSharedFallbackState())
           .setPrimaryChannelName("directpath")
           .setFallbackChannelName("cloudpath")
           .setMinFailedCalls(10)
@@ -2126,6 +2127,7 @@ public class GapicSpannerRpcTest {
         GcpFallbackOpenTelemetry fallbackTelemetry, int minFailedCalls) {
       // Override default 1-minute period to 10ms for instant testing
       return GcpFallbackChannelOptions.newBuilder()
+          .setSharedState(getSharedFallbackState())
           .setPrimaryChannelName("directpath")
           .setFallbackChannelName("cloudpath")
           .setMinFailedCalls(1)
@@ -2195,5 +2197,114 @@ public class GapicSpannerRpcTest {
 
   private boolean hasValue(MetricData metricData) {
     return metricData.getLongSumData().getPoints().stream().anyMatch(point -> point.getValue() > 0);
+  }
+
+  @Test
+  public void testCreateFallbackChannelOptions_attachesPrimerProbingFunction() {
+    SpannerOptions.useEnvironment(new SpannerOptions.SpannerEnvironment() {});
+    GapicSpannerRpc rpc = null;
+    try {
+      SpannerOptions options =
+          SpannerOptions.newBuilder()
+              .setProjectId("test-project")
+              .setCredentials(NoCredentials.getInstance())
+              .setEnableDirectAccess(true)
+              .build();
+      rpc = new GapicSpannerRpc(options);
+      GcpFallbackChannelOptions fallbackOptions =
+          rpc.createFallbackChannelOptions(
+              GcpFallbackOpenTelemetry.newBuilder().build(), /* minFailedCalls= */ 5);
+      assertNotNull(fallbackOptions.getPrimaryProbingFunction());
+      assertTrue(fallbackOptions.isEnableRecovery());
+      assertEquals(50, fallbackOptions.getMinPrimaryProbeSuccessCount());
+      assertEquals(Duration.ofMinutes(10), fallbackOptions.getMinPrimaryProbeSuccessDuration());
+      assertEquals(Duration.ofSeconds(10), fallbackOptions.getPrimaryProbingInterval());
+      assertSame(rpc.getSharedFallbackState(), fallbackOptions.getSharedState());
+    } finally {
+      if (rpc != null) {
+        rpc.shutdown();
+      }
+      SpannerOptions.useDefaultEnvironment();
+    }
+  }
+
+  @Test
+  public void testExecutePrimerProbe_whenNoSessionAvailable_returnsWaitingForRealSession() {
+    io.grpc.ManagedChannel channel = org.mockito.Mockito.mock(io.grpc.ManagedChannel.class);
+    assertEquals("WAITING_FOR_REAL_SESSION", GapicSpannerRpc.executePrimerProbe(null, channel));
+
+    DynamicChannelPoolPrimer primer = org.mockito.Mockito.mock(DynamicChannelPoolPrimer.class);
+    org.mockito.Mockito.when(primer.getPrimeSessionName()).thenReturn(null);
+    assertEquals("WAITING_FOR_REAL_SESSION", GapicSpannerRpc.executePrimerProbe(primer, channel));
+  }
+
+  @Test
+  public void testExecutePrimerProbe_whenPrimeSucceeds_returnsOk() {
+    io.grpc.ManagedChannel channel = org.mockito.Mockito.mock(io.grpc.ManagedChannel.class);
+    DynamicChannelPoolPrimer primer = org.mockito.Mockito.mock(DynamicChannelPoolPrimer.class);
+    org.mockito.Mockito.when(primer.getPrimeSessionName())
+        .thenReturn("projects/p/instances/i/databases/d/sessions/s");
+    org.mockito.Mockito.when(primer.prime(channel)).thenReturn(Futures.immediateVoidFuture());
+
+    assertEquals("OK", GapicSpannerRpc.executePrimerProbe(primer, channel));
+  }
+
+  @Test
+  public void testExecutePrimerProbe_whenPrimeFailsWithStatusRuntimeException_returnsStatusCode() {
+    io.grpc.ManagedChannel channel = org.mockito.Mockito.mock(io.grpc.ManagedChannel.class);
+    DynamicChannelPoolPrimer primer = org.mockito.Mockito.mock(DynamicChannelPoolPrimer.class);
+    org.mockito.Mockito.when(primer.getPrimeSessionName())
+        .thenReturn("projects/p/instances/i/databases/d/sessions/s");
+    io.grpc.StatusRuntimeException exception =
+        new io.grpc.StatusRuntimeException(io.grpc.Status.UNAVAILABLE);
+    org.mockito.Mockito.when(primer.prime(channel))
+        .thenReturn(Futures.immediateFailedFuture(exception));
+
+    assertEquals("UNAVAILABLE", GapicSpannerRpc.executePrimerProbe(primer, channel));
+  }
+
+  @Test
+  public void testExecutePrimerProbe_whenPrimeTimesOut_returnsDeadlineExceeded() {
+    io.grpc.ManagedChannel channel = org.mockito.Mockito.mock(io.grpc.ManagedChannel.class);
+    DynamicChannelPoolPrimer primer = org.mockito.Mockito.mock(DynamicChannelPoolPrimer.class);
+    org.mockito.Mockito.when(primer.getPrimeSessionName())
+        .thenReturn("projects/p/instances/i/databases/d/sessions/s");
+
+    @SuppressWarnings("unchecked")
+    com.google.common.util.concurrent.ListenableFuture<Void> timeoutFuture =
+        org.mockito.Mockito.mock(com.google.common.util.concurrent.ListenableFuture.class);
+    try {
+      org.mockito.Mockito.when(
+              timeoutFuture.get(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any()))
+          .thenThrow(new java.util.concurrent.TimeoutException("Timeout"));
+    } catch (Exception e) {
+      // Ignored in stubbing
+    }
+    org.mockito.Mockito.when(primer.prime(channel)).thenReturn(timeoutFuture);
+
+    assertEquals("DEADLINE_EXCEEDED", GapicSpannerRpc.executePrimerProbe(primer, channel));
+  }
+
+  @Test
+  public void testExecutePrimerProbe_unregisteredSourceReturnsWaitingForRealSession() {
+    DynamicChannelPoolPrimer primer =
+        new DynamicChannelPoolPrimer(
+            new SpannerMetadataProvider(
+                java.util.Collections.emptyMap(), java.util.Collections.emptyMap()),
+            "projects/test-project",
+            new XGoogSpannerRequestId.RequestIdCreatorImpl(),
+            null,
+            Duration.ofSeconds(5));
+
+    io.grpc.ManagedChannel channel = org.mockito.Mockito.mock(io.grpc.ManagedChannel.class);
+    assertEquals("WAITING_FOR_REAL_SESSION", GapicSpannerRpc.executePrimerProbe(primer, channel));
+
+    SpannerRpc.ChannelPrimeSessionSource source = () -> "projects/p/instances/i/databases/d/sessions/s";
+    primer.registerPrimeSessionSource(source);
+    assertEquals("projects/p/instances/i/databases/d/sessions/s", primer.getPrimeSessionName());
+
+    primer.unregisterPrimeSessionSource(source);
+    assertNull(primer.getPrimeSessionName());
+    assertEquals("WAITING_FOR_REAL_SESSION", GapicSpannerRpc.executePrimerProbe(primer, channel));
   }
 }

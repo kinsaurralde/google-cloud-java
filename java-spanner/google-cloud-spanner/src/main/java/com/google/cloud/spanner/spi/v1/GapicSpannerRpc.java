@@ -72,6 +72,7 @@ import com.google.cloud.grpc.GrpcTransportOptions;
 import com.google.cloud.grpc.fallback.GcpFallbackChannel;
 import com.google.cloud.grpc.fallback.GcpFallbackChannelOptions;
 import com.google.cloud.grpc.fallback.GcpFallbackOpenTelemetry;
+import com.google.cloud.grpc.fallback.GcpFallbackState;
 import com.google.cloud.spanner.AdminRequestsPerMinuteExceededException;
 import com.google.cloud.spanner.BackupId;
 import com.google.cloud.spanner.ErrorCode;
@@ -267,6 +268,8 @@ public class GapicSpannerRpc implements SpannerRpc {
   public static volatile boolean DIRECTPATH_CHANNEL_CREATED = false;
 
   private static final String API_FILE = "grpc-gcp-apiconfig.json";
+
+  private final GcpFallbackState sharedFallbackState = new GcpFallbackState();
 
   private final RequestIdCreator requestIdCreator = new RequestIdCreatorImpl();
   private boolean rpcIsClosed;
@@ -595,14 +598,25 @@ public class GapicSpannerRpc implements SpannerRpc {
   }
 
   @VisibleForTesting
+  GcpFallbackState getSharedFallbackState() {
+    return sharedFallbackState;
+  }
+
+  @VisibleForTesting
   GcpFallbackChannelOptions createFallbackChannelOptions(
       GcpFallbackOpenTelemetry fallbackTelemetry, int minFailedCalls) {
     return GcpFallbackChannelOptions.newBuilder()
+        .setSharedState(sharedFallbackState)
         .setPrimaryChannelName("directpath")
         .setFallbackChannelName("cloudpath")
         .setMinFailedCalls(minFailedCalls)
         .setPeriod(Duration.ofMinutes(3))
         .setGcpFallbackOpenTelemetry(fallbackTelemetry)
+        .setPrimaryProbingFunction(channel -> executePrimerProbe(this.channelPrimer, channel))
+        .setPrimaryProbingInterval(Duration.ofSeconds(10))
+        .setMinPrimaryProbeSuccessCount(50)
+        .setMinPrimaryProbeSuccessDuration(Duration.ofMinutes(10))
+        .setEnableRecovery(true)
         .build();
   }
 
@@ -701,25 +715,6 @@ public class GapicSpannerRpc implements SpannerRpc {
             builder = existingConfigurator.apply(builder);
           }
 
-          ManagedChannelBuilder<?> primaryBuilder = builder;
-          ManagedChannelBuilder<?> fallbackBuilder = cloudPathBuilder;
-          if (options.isGrpcGcpExtensionEnabled()) {
-            String jsonApiConfig = parseGrpcGcpApiConfig();
-            GcpManagedChannelOptions gcpOptions =
-                grpcGcpOptionsWithMetricsAndDcp(options, channelPrimer);
-            if (gcpOptions == null) {
-              gcpOptions = GcpManagedChannelOptions.newBuilder().build();
-            }
-            primaryBuilder =
-                GcpManagedChannelBuilder.forDelegateBuilder(builder)
-                    .withApiConfigJsonString(jsonApiConfig)
-                    .withOptions(gcpOptions);
-            fallbackBuilder =
-                GcpManagedChannelBuilder.forDelegateBuilder(cloudPathBuilder)
-                    .withApiConfigJsonString(jsonApiConfig)
-                    .withOptions(gcpOptions);
-          }
-
           GcpFallbackOpenTelemetry fallbackTelemetry =
               GcpFallbackOpenTelemetry.newBuilder()
                   .withSdk(getFallbackOpenTelemetry(options))
@@ -727,8 +722,24 @@ public class GapicSpannerRpc implements SpannerRpc {
                   .enableMetrics(Arrays.asList("fallback_count", "call_status"))
                   .build();
 
-          return new FallbackChannelBuilder(
-              primaryBuilder, fallbackBuilder, createFallbackChannelOptions(fallbackTelemetry, 1));
+          FallbackChannelBuilder fallbackDelegate =
+              new FallbackChannelBuilder(
+                  builder, cloudPathBuilder, createFallbackChannelOptions(fallbackTelemetry, 1));
+
+          if (options.isGrpcGcpExtensionEnabled()) {
+            String jsonApiConfig = parseGrpcGcpApiConfig();
+            GcpManagedChannelOptions gcpOptions =
+                grpcGcpOptionsWithMetricsAndDcp(options, channelPrimer);
+            if (gcpOptions == null) {
+              gcpOptions = GcpManagedChannelOptions.newBuilder().build();
+            }
+
+            return GcpManagedChannelBuilder.forDelegateBuilder(fallbackDelegate)
+                .withApiConfigJsonString(jsonApiConfig)
+                .withOptions(gcpOptions);
+          }
+
+          return fallbackDelegate;
         });
   }
 
@@ -759,6 +770,7 @@ public class GapicSpannerRpc implements SpannerRpc {
             // commit GRPC calls succeed
             .setKeepAliveTimeDuration(options.getGrpcKeepAliveTime())
             .setKeepAliveTimeoutDuration(options.getGrpcKeepAliveTimeout())
+            .setKeepAliveWithoutCalls(true)
 
             // Then check if SpannerOptions provides an InterceptorProvider. Create a default
             // SpannerInterceptorProvider if none is provided
@@ -810,7 +822,9 @@ public class GapicSpannerRpc implements SpannerRpc {
   @Nullable
   private DynamicChannelPoolPrimer createChannelPrimer(
       SpannerOptions options, CredentialsProvider credentialsProvider) {
-    if (!options.isGrpcGcpExtensionEnabled() || !options.isDynamicChannelPoolEnabled()) {
+    if (!options.isGrpcGcpExtensionEnabled()
+        || (!options.isDynamicChannelPoolEnabled()
+            && !Boolean.TRUE.equals(options.isEnableGcpFallback()))) {
       return null;
     }
     return new DynamicChannelPoolPrimer(
@@ -2548,6 +2562,7 @@ public class GapicSpannerRpc implements SpannerRpc {
       this.instanceAdminStub.close();
       this.databaseAdminStub.close();
       this.spannerWatchdog.shutdown();
+      this.sharedFallbackState.shutdown();
 
       try {
         this.spannerStub.awaitTermination(10L, TimeUnit.SECONDS);
@@ -2569,6 +2584,7 @@ public class GapicSpannerRpc implements SpannerRpc {
     this.instanceAdminStub.close();
     this.databaseAdminStub.close();
     this.spannerWatchdog.shutdown();
+    this.sharedFallbackState.shutdownNow();
 
     this.spannerStub.shutdownNow();
     this.partitionedDmlStub.shutdownNow();
@@ -2678,6 +2694,30 @@ public class GapicSpannerRpc implements SpannerRpc {
   private static Duration systemProperty(String name, int defaultValue) {
     String stringValue = System.getProperty(name, "");
     return Duration.ofSeconds(stringValue.isEmpty() ? defaultValue : Integer.parseInt(stringValue));
+  }
+
+  @VisibleForTesting
+  static String executePrimerProbe(
+      @Nullable DynamicChannelPoolPrimer primer, io.grpc.Channel channel) {
+    if (primer == null || primer.getPrimeSessionName() == null) {
+      return "WAITING_FOR_REAL_SESSION";
+    }
+
+    try {
+      io.grpc.ManagedChannel managedChannel = (io.grpc.ManagedChannel) channel;
+      com.google.common.util.concurrent.ListenableFuture<Void> primeFuture =
+          primer.prime(managedChannel);
+
+      primeFuture.get(5, java.util.concurrent.TimeUnit.SECONDS);
+      return "OK";
+    } catch (java.util.concurrent.ExecutionException e) {
+      io.grpc.Status status = io.grpc.Status.fromThrowable(e.getCause());
+      return status.getCode().name();
+    } catch (java.util.concurrent.TimeoutException e) {
+      return io.grpc.Status.Code.DEADLINE_EXCEEDED.name();
+    } catch (Exception e) {
+      return "ERROR";
+    }
   }
 
   // Wrapper class to build the GcpFallbackChannel using GAX's configuration
