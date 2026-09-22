@@ -30,7 +30,9 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.spanner.v1.ExecuteSqlRequest;
+import com.google.spanner.v1.GetSessionRequest;
 import com.google.spanner.v1.ResultSet;
+import com.google.spanner.v1.Session;
 import com.google.spanner.v1.SpannerGrpc;
 import io.grpc.CallCredentials;
 import io.grpc.CallOptions;
@@ -97,9 +99,10 @@ public class DynamicChannelPoolPrimerTest {
   private static final Metadata.Key<String> REQUEST_ID_KEY =
       Metadata.Key.of("x-goog-spanner-request-id", Metadata.ASCII_STRING_MARSHALLER);
 
-  /** Minimal Spanner service that only serves ExecuteSql and can hold or fail calls. */
+  /** Minimal Spanner service that serves ExecuteSql and GetSession and can hold or fail calls. */
   private static final class PrimeService extends SpannerGrpc.SpannerImplBase {
     final List<ExecuteSqlRequest> requests = new CopyOnWriteArrayList<>();
+    final List<GetSessionRequest> getSessionRequests = new CopyOnWriteArrayList<>();
     final List<Metadata> headers = new CopyOnWriteArrayList<>();
     volatile boolean holdResponses;
     volatile CountDownLatch callStarted = new CountDownLatch(1);
@@ -122,6 +125,25 @@ public class DynamicChannelPoolPrimerTest {
         return;
       }
       responseObserver.onNext(ResultSet.getDefaultInstance());
+      responseObserver.onCompleted();
+    }
+
+    @Override
+    public void getSession(GetSessionRequest request, StreamObserver<Session> responseObserver) {
+      getSessionRequests.add(request);
+      ServerCallStreamObserver<Session> serverObserver =
+          (ServerCallStreamObserver<Session>) responseObserver;
+      serverObserver.setOnCancelHandler(() -> callCancelled.countDown());
+      callStarted.countDown();
+      if (holdResponses) {
+        return;
+      }
+      Status failure = failWith;
+      if (failure != null) {
+        responseObserver.onError(failure.asRuntimeException());
+        return;
+      }
+      responseObserver.onNext(Session.newBuilder().setName(request.getName()).build());
       responseObserver.onCompleted();
     }
   }
@@ -648,5 +670,42 @@ public class DynamicChannelPoolPrimerTest {
     assertThrows(NullPointerException.class, () -> primer.registerPrimeSessionSource(null));
     assertThrows(NullPointerException.class, () -> primer.unregisterPrimeSessionSource(null));
     assertThat(primer.getPrimeSessionSources()).isEmpty();
+  }
+
+  @Test
+  public void directPathFallbackProber_executesGetSessionProbe() throws Exception {
+    ChannelSessionRegistry registry = new ChannelSessionRegistry();
+    SpannerMetadataProvider metadataProvider =
+        SpannerMetadataProvider.create(
+            ImmutableMap.of("x-goog-api-client", "test-client", "user-agent", "test-agent"),
+            RESOURCE_HEADER_KEY);
+    DirectPathFallbackProber prober =
+        new DirectPathFallbackProber(
+            registry,
+            metadataProvider,
+            PROJECT_NAME,
+            requestIdCreator,
+            () -> credentialsWithToken(DEFAULT_TOKEN),
+            Duration.ofSeconds(5));
+    ManagedChannel channel = newChannel();
+
+    // 1. Returns waiting before any session source is registered.
+    assertThat(prober.probe(channel)).isEqualTo("WAITING_FOR_REAL_SESSION");
+    assertThat(service.getSessionRequests).isEmpty();
+
+    // 2. Executes GetSession with expected headers once a session is available.
+    registry.register(new MutableSessionSource(SESSION_NAME));
+    assertThat(prober.probe(channel)).isEqualTo("");
+    assertThat(service.getSessionRequests).hasSize(1);
+    assertThat(service.getSessionRequests.get(0).getName()).isEqualTo(SESSION_NAME);
+    Metadata firstHeaders = service.headers.get(0);
+    assertThat(firstHeaders.get(RESOURCE_PREFIX_KEY)).isEqualTo(DATABASE_NAME);
+    assertThat(firstHeaders.get(REQUEST_PARAMS_KEY))
+        .isEqualTo("name=" + java.net.URLEncoder.encode(SESSION_NAME, "UTF-8"));
+    assertThat(firstHeaders.get(REQUEST_ID_KEY)).isNotEmpty();
+
+    // 3. Returns gRPC status code name on failure.
+    service.failWith = Status.UNAVAILABLE.withDescription("DirectPath down");
+    assertThat(prober.probe(channel)).isEqualTo(Status.Code.UNAVAILABLE.name());
   }
 }

@@ -242,7 +242,7 @@ public class GcpFallbackChannelTest {
         && options.getPeriod() != null
         && options.getPeriod().toMillis() > 0) {
       verify(mockScheduledExecutorService)
-          .scheduleAtFixedRate(
+          .scheduleWithFixedDelay(
               checkErrorRatesTaskCaptor.capture(),
               eq(options.getPeriod().toMillis()),
               eq(options.getPeriod().toMillis()),
@@ -250,7 +250,7 @@ public class GcpFallbackChannelTest {
       checkErrorRatesTask = checkErrorRatesTaskCaptor.getValue();
     } else {
       verify(mockScheduledExecutorService, never())
-          .scheduleAtFixedRate(
+          .scheduleWithFixedDelay(
               checkErrorRatesTaskCaptor.capture(),
               eq(options.getPeriod().toMillis()),
               eq(options.getPeriod().toMillis()),
@@ -259,7 +259,7 @@ public class GcpFallbackChannelTest {
     }
     if (options.getPrimaryProbingFunction() != null) {
       verify(mockScheduledExecutorService)
-          .scheduleAtFixedRate(
+          .scheduleWithFixedDelay(
               primaryProbingTaskCaptor.capture(),
               eq(options.getPrimaryProbingInterval().toMillis()),
               eq(options.getPrimaryProbingInterval().toMillis()),
@@ -267,7 +267,7 @@ public class GcpFallbackChannelTest {
       primaryProbingTask = primaryProbingTaskCaptor.getValue();
     } else {
       verify(mockScheduledExecutorService, never())
-          .scheduleAtFixedRate(
+          .scheduleWithFixedDelay(
               primaryProbingTaskCaptor.capture(),
               eq(options.getPrimaryProbingInterval().toMillis()),
               eq(options.getPrimaryProbingInterval().toMillis()),
@@ -276,7 +276,7 @@ public class GcpFallbackChannelTest {
     }
     if (options.getFallbackProbingFunction() != null) {
       verify(mockScheduledExecutorService)
-          .scheduleAtFixedRate(
+          .scheduleWithFixedDelay(
               fallbackProbingTaskCaptor.capture(),
               eq(options.getFallbackProbingInterval().toMillis()),
               eq(options.getFallbackProbingInterval().toMillis()),
@@ -284,7 +284,7 @@ public class GcpFallbackChannelTest {
       fallbackProbingTask = fallbackProbingTaskCaptor.getValue();
     } else {
       verify(mockScheduledExecutorService, never())
-          .scheduleAtFixedRate(
+          .scheduleWithFixedDelay(
               fallbackProbingTaskCaptor.capture(),
               eq(options.getFallbackProbingInterval().toMillis()),
               eq(options.getFallbackProbingInterval().toMillis()),
@@ -1349,7 +1349,7 @@ public class GcpFallbackChannelTest {
     try {
       // Both channels share the same state, so only 1 evaluation loop is scheduled
       verify(mockExec)
-          .scheduleAtFixedRate(
+          .scheduleWithFixedDelay(
               taskCaptor.capture(),
               eq(options.getPeriod().toMillis()),
               eq(options.getPeriod().toMillis()),
@@ -1470,7 +1470,7 @@ public class GcpFallbackChannelTest {
 
     try {
       verify(mockExec, atLeast(2))
-          .scheduleAtFixedRate(
+          .scheduleWithFixedDelay(
               taskCaptor.capture(),
               eq(options.getPrimaryProbingInterval().toMillis()),
               eq(options.getPrimaryProbingInterval().toMillis()),

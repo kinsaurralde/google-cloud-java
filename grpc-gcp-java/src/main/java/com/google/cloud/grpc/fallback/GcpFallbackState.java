@@ -229,11 +229,11 @@ public class GcpFallbackState {
   }
 
   synchronized ScheduledFuture<?> scheduleTask(
-      Runnable command, long initialDelay, long period, TimeUnit unit) {
+      Runnable command, long initialDelay, long delay, TimeUnit unit) {
     if (isShutdown || this.execService == null || this.execService.isShutdown()) {
       return null;
     }
-    return this.execService.scheduleAtFixedRate(
+    return this.execService.scheduleWithFixedDelay(
         () -> {
           try {
             command.run();
@@ -241,7 +241,7 @@ public class GcpFallbackState {
           }
         },
         initialDelay,
-        period,
+        delay,
         unit);
   }
 

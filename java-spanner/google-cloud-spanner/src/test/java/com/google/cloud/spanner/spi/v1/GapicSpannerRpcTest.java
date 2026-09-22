@@ -2682,8 +2682,9 @@ public class GapicSpannerRpcTest {
       GrpcGcpObjectCounts before = countGrpcGcpObjectsFromChannelz();
       rpc = new GapicSpannerRpc(options);
       GrpcGcpObjectCounts counts = countGrpcGcpObjectsFromChannelz().minus(before);
-      assertEquals(counts.debugString(), 6, counts.gcpManagedChannels);
-      assertEquals(counts.debugString(), 48, counts.channelRefs);
+      assertEquals(counts.debugString(), 3, counts.gcpManagedChannels);
+      assertEquals(counts.debugString(), 24, counts.channelRefs);
+      assertNotNull(rpc.getFallbackProber());
     } finally {
       if (rpc != null) {
         rpc.shutdown();
@@ -2849,6 +2850,7 @@ public class GapicSpannerRpcTest {
         GcpFallbackOpenTelemetry fallbackTelemetry, int minFailedCalls) {
       // Override default 1-minute period to 10ms for instant testing
       return GcpFallbackChannelOptions.newBuilder()
+          .setSharedState(getSharedFallbackState())
           .setPrimaryChannelName("directpath")
           .setFallbackChannelName("cloudpath")
           .setMinFailedCalls(10)
@@ -2928,6 +2930,7 @@ public class GapicSpannerRpcTest {
         GcpFallbackOpenTelemetry fallbackTelemetry, int minFailedCalls) {
       // Override default 1-minute period to 10ms for instant testing
       return GcpFallbackChannelOptions.newBuilder()
+          .setSharedState(getSharedFallbackState())
           .setPrimaryChannelName("directpath")
           .setFallbackChannelName("cloudpath")
           .setMinFailedCalls(1)
