@@ -22,12 +22,10 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 
 /**
@@ -39,13 +37,10 @@ public class GcpFallbackState implements AutoCloseable {
   private final LongAdder primaryFailures = new LongAdder();
   private final LongAdder fallbackSuccesses = new LongAdder();
   private final LongAdder fallbackFailures = new LongAdder();
-  private final AtomicLong primaryProbeSuccesses = new AtomicLong(0);
-  private final AtomicLong firstPrimaryProbeSuccessNanos = new AtomicLong(0);
-  private final AtomicLong generation = new AtomicLong(0);
   private final AtomicBoolean inFallbackMode = new AtomicBoolean(false);
   private final AtomicBoolean fallbackAvailable = new AtomicBoolean(false);
   private final AtomicBoolean evaluationStarted = new AtomicBoolean(false);
-  private final Set<Runnable> stateChangeCallbacks = ConcurrentHashMap.newKeySet();
+  private final Set<GcpFallbackChannel> channels = ConcurrentHashMap.newKeySet();
 
   private ScheduledExecutorService execService = null;
   private boolean ownsExecutor = false;
@@ -58,28 +53,6 @@ public class GcpFallbackState implements AutoCloseable {
   GcpFallbackState(ScheduledExecutorService execService) {
     this.execService = execService;
     this.ownsExecutor = true;
-  }
-
-  synchronized void registerStateChangeCallback(Runnable callback) {
-    if (!isShutdown) {
-      stateChangeCallbacks.add(callback);
-    }
-  }
-
-  synchronized void unregisterStateChangeCallback(Runnable callback) {
-    stateChangeCallbacks.remove(callback);
-  }
-
-  private void runStateChangeCallbacks(List<Runnable> callbacks) {
-    if (callbacks == null) {
-      return;
-    }
-    for (Runnable callback : callbacks) {
-      try {
-        callback.run();
-      } catch (Throwable t) {
-      }
-    }
   }
 
   LongAdder getPrimarySuccesses() {
@@ -98,11 +71,6 @@ public class GcpFallbackState implements AutoCloseable {
     return fallbackFailures;
   }
 
-  @VisibleForTesting
-  AtomicLong getPrimaryProbeSuccesses() {
-    return primaryProbeSuccesses;
-  }
-
   void setFallbackAvailable(boolean available) {
     this.fallbackAvailable.set(available);
   }
@@ -111,94 +79,70 @@ public class GcpFallbackState implements AutoCloseable {
     return inFallbackMode.get();
   }
 
-  long getGeneration() {
-    return generation.get();
+  @VisibleForTesting
+  int getRegisteredChannelCount() {
+    return channels.size();
   }
 
-  private void enterFallbackMode() {
-    primaryProbeSuccesses.set(0);
-    firstPrimaryProbeSuccessNanos.set(0);
-    generation.incrementAndGet();
-    inFallbackMode.set(true);
-  }
-
-  private void exitFallbackMode() {
-    // Also clears the primary call counters so the post-recovery error window starts fresh.
-    primaryFailures.reset();
-    primarySuccesses.reset();
-    primaryProbeSuccesses.set(0);
-    firstPrimaryProbeSuccessNanos.set(0);
-    generation.incrementAndGet();
-    inFallbackMode.set(false);
-  }
-
-  /** Returns the registered callbacks to be run by the caller <em>outside</em> the monitor. */
-  private List<Runnable> snapshotAndClearCallbacks() {
-    List<Runnable> callbacks = new ArrayList<>(stateChangeCallbacks);
-    stateChangeCallbacks.clear();
-    return callbacks;
-  }
-
-  /** Bumps the generation counter and transitions the pool to fallback mode. */
-  boolean triggerFallback() {
-    boolean fallbackTriggered = false;
-    List<Runnable> callbacks = null;
+  void registerChannel(GcpFallbackChannel channel) {
+    boolean alreadyInFallback = false;
     synchronized (this) {
-      if (!inFallbackMode.get()) {
-        enterFallbackMode();
-        callbacks = snapshotAndClearCallbacks();
-        fallbackTriggered = true;
+      if (!isShutdown) {
+        channels.add(channel);
+        alreadyInFallback = inFallbackMode.get();
       }
     }
-    if (fallbackTriggered) {
-      runStateChangeCallbacks(callbacks);
+    if (alreadyInFallback) {
+      channel.enterFallbackMode();
     }
-    return fallbackTriggered;
   }
 
-  /**
-   * Records a primary probe result and recovers the pool if consecutive probe success count and
-   * duration criteria are met.
-   */
-  void recordPrimaryProbeResult(
-      boolean success, long expectedGeneration, GcpFallbackChannelOptions options) {
-    if (!options.isEnableRecovery()) {
+  synchronized void unregisterChannel(GcpFallbackChannel channel) {
+    channels.remove(channel);
+    if (!inFallbackMode.get()) {
       return;
     }
-    boolean recovered = false;
-    List<Runnable> callbacks = null;
+    boolean anyOnPrimary = false;
+    for (GcpFallbackChannel remaining : channels) {
+      if (!remaining.isInFallbackMode()) {
+        anyOnPrimary = true;
+        break;
+      }
+    }
+    if (channels.isEmpty() || anyOnPrimary) {
+      resetFallbackMode();
+    }
+  }
+
+  synchronized void onChannelRecovered() {
+    resetFallbackMode();
+  }
+
+  private void resetFallbackMode() {
+    if (inFallbackMode.compareAndSet(true, false)) {
+      // Clears the primary call counters when the first channel recovers so the post-recovery
+      // error window starts fresh without resetting counters again when later channels recover.
+      primaryFailures.reset();
+      primarySuccesses.reset();
+    }
+  }
+
+  /** Transitions the pool to fallback mode and notifies all registered channels. */
+  boolean triggerFallback() {
+    List<GcpFallbackChannel> registeredChannels = null;
     synchronized (this) {
-      if (generation.get() != expectedGeneration || !inFallbackMode.get()) {
-        return;
-      }
-      if (!success) {
-        primaryProbeSuccesses.set(0);
-        firstPrimaryProbeSuccessNanos.set(0);
-        return;
-      }
-      long nowNanos = System.nanoTime();
-      long firstSuccessNanos =
-          firstPrimaryProbeSuccessNanos.updateAndGet(prev -> prev == 0 ? nowNanos : prev);
-      long primaryProbeSuccessCount = primaryProbeSuccesses.incrementAndGet();
-
-      boolean durationSatisfied = true;
-      if (options.getMinPrimaryProbeSuccessDuration() != null
-          && !options.getMinPrimaryProbeSuccessDuration().isZero()
-          && !options.getMinPrimaryProbeSuccessDuration().isNegative()) {
-        long elapsedNanos = nowNanos - firstSuccessNanos;
-        durationSatisfied = elapsedNanos >= options.getMinPrimaryProbeSuccessDuration().toNanos();
-      }
-
-      if (primaryProbeSuccessCount >= options.getMinPrimaryProbeSuccessCount()
-          && durationSatisfied) {
-        exitFallbackMode();
-        callbacks = snapshotAndClearCallbacks();
-        recovered = true;
+      if (!inFallbackMode.get()) {
+        inFallbackMode.set(true);
+        registeredChannels = new ArrayList<>(channels);
       }
     }
-    if (recovered) {
-      runStateChangeCallbacks(callbacks);
+    if (registeredChannels != null) {
+      for (GcpFallbackChannel channel : registeredChannels) {
+        channel.enterFallbackMode();
+      }
+      return true;
     }
+    return false;
   }
 
   synchronized ScheduledExecutorService getOrCreateExecutorService(
@@ -225,9 +169,11 @@ public class GcpFallbackState implements AutoCloseable {
       this.execService = options.getSharedExecutorService();
       this.ownsExecutor = false;
     } else {
-      this.execService =
-          Executors.newScheduledThreadPool(
+      java.util.concurrent.ScheduledThreadPoolExecutor executor =
+          new java.util.concurrent.ScheduledThreadPoolExecutor(
               3, GcpThreadFactory.newThreadFactory("gcp-fallback-state-%d"));
+      executor.setRemoveOnCancelPolicy(true);
+      this.execService = executor;
       this.ownsExecutor = true;
     }
     return this.execService;
@@ -288,7 +234,7 @@ public class GcpFallbackState implements AutoCloseable {
   void checkErrorRates(GcpFallbackChannelOptions options, GcpFallbackOpenTelemetry openTelemetry) {
     float primaryErrorRate = 0f;
     boolean fallbackTriggered = false;
-    List<Runnable> callbacks = null;
+    List<GcpFallbackChannel> registeredChannels = null;
     synchronized (this) {
       long primarySuccessCount = primarySuccesses.sumThenReset();
       long primaryFailureCount = primaryFailures.sumThenReset();
@@ -303,13 +249,15 @@ public class GcpFallbackState implements AutoCloseable {
               && primaryFailureCount >= options.getMinFailedCalls()
               && primaryErrorRate >= options.getErrorRateThreshold();
       if (shouldTriggerFallback) {
-        enterFallbackMode();
-        callbacks = snapshotAndClearCallbacks();
+        inFallbackMode.set(true);
+        registeredChannels = new ArrayList<>(channels);
         fallbackTriggered = true;
       }
     }
-    if (fallbackTriggered) {
-      runStateChangeCallbacks(callbacks);
+    if (registeredChannels != null) {
+      for (GcpFallbackChannel channel : registeredChannels) {
+        channel.enterFallbackMode();
+      }
     }
     boolean currentInFallback = inFallbackMode.get();
 
@@ -351,7 +299,7 @@ public class GcpFallbackState implements AutoCloseable {
   /** Shuts down the state, cancelling evaluation and shutting down internal executor if owned. */
   public synchronized void shutdown() {
     isShutdown = true;
-    stateChangeCallbacks.clear();
+    channels.clear();
     stopPeriodicEvaluation();
     if (ownsExecutor && execService != null && !execService.isShutdown()) {
       execService.shutdown();
@@ -364,7 +312,7 @@ public class GcpFallbackState implements AutoCloseable {
    */
   public synchronized void shutdownNow() {
     isShutdown = true;
-    stateChangeCallbacks.clear();
+    channels.clear();
     stopPeriodicEvaluation();
     if (ownsExecutor && execService != null && !execService.isShutdown()) {
       execService.shutdownNow();

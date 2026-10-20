@@ -2717,6 +2717,38 @@ public class GapicSpannerRpcTest {
       // One fallback state per pool.
       assertEquals(3, new HashSet<>(rpc.getFallbackStates()).size());
       assertNotNull(rpc.getFallbackProber());
+
+      // Verify createFallbackChannelOptions sets per-channel probe threshold = 10 over 10m
+      GcpFallbackState state = rpc.getFallbackStates().get(0);
+      GcpFallbackChannelOptions fallbackOptions = rpc.createFallbackChannelOptions(null, 3, state);
+      assertEquals(10, fallbackOptions.getMinPrimaryProbeSuccessCount());
+      assertEquals(Duration.ofMinutes(10), fallbackOptions.getMinPrimaryProbeSuccessDuration());
+      assertNotNull(fallbackOptions.getPrimaryProbingFunction());
+
+      // Verify lazy CloudPath connection at startup: all GcpFallbackChannels have not entered
+      // fallback mode, and their fallbackDelegateChannels remain IDLE at startup.
+      List<com.google.cloud.grpc.fallback.GcpFallbackChannel> fallbackChannels = new ArrayList<>();
+      visitObjectGraph(
+          rpc,
+          Collections.newSetFromMap(new IdentityHashMap<>()),
+          object -> {
+            if (object instanceof com.google.cloud.grpc.fallback.GcpFallbackChannel) {
+              fallbackChannels.add((com.google.cloud.grpc.fallback.GcpFallbackChannel) object);
+            }
+          });
+      assertEquals(24, fallbackChannels.size());
+      for (com.google.cloud.grpc.fallback.GcpFallbackChannel fbChannel : fallbackChannels) {
+        assertFalse(fbChannel.isInFallbackMode());
+        java.lang.reflect.Field fallbackDelegateField =
+            com.google.cloud.grpc.fallback.GcpFallbackChannel.class.getDeclaredField(
+                "fallbackDelegateChannel");
+        fallbackDelegateField.setAccessible(true);
+        io.grpc.ManagedChannel fallbackDelegate =
+            (io.grpc.ManagedChannel) fallbackDelegateField.get(fbChannel);
+        assertEquals(io.grpc.ConnectivityState.IDLE, fallbackDelegate.getState(false));
+      }
+    } catch (ReflectiveOperationException e) {
+      throw new AssertionError(e);
     } finally {
       if (rpc != null) {
         rpc.shutdown();

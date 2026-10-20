@@ -659,7 +659,7 @@ public class GapicSpannerRpc implements SpannerRpc {
       builder
           .setPrimaryProbingFunction(fallbackProber)
           .setPrimaryProbingInterval(Duration.ofMinutes(1))
-          .setMinPrimaryProbeSuccessCount(20)
+          .setMinPrimaryProbeSuccessCount(10)
           .setMinPrimaryProbeSuccessDuration(Duration.ofMinutes(10))
           .setEnableRecovery(true);
     }
